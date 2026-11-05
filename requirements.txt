@@ -1,3 +1,4 @@
 capstone>=5.0
 mcp>=1.2
 pefile>=2023.2.7
+openai>=1.40

@@ -85,7 +85,8 @@ class Image:
                             bool(s.Characteristics & 0x20000000))
                 return img, [ib + pe.OPTIONAL_HEADER.AddressOfEntryPoint]
             except ImportError:
-                pass  # fall through: treat as raw bytes
+                raise ValueError("Input looks like a PE file (MZ header) but pefile is not "
+                                 "installed: pip install pefile")
         img = cls()
         img.add(base, data, True)
         return img, [base]
@@ -474,14 +475,10 @@ class Analyzer:
 
 
 # ------------------------------------------------------------------ renderers
-def _du_str(ins):
-    s = "D:"
-    if ins["defs"]:
-        s += " " + ", ".join(ins["defs"])
-    s += " U:"
-    if ins["uses"]:
-        s += " " + ", ".join(ins["uses"])
-    return s
+def _du_str(ins, empty=""):
+    d = ", ".join(ins["defs"]) or empty
+    u = ", ".join(ins["uses"]) or empty
+    return ("D: %s U: %s" % (d, u)).replace("  ", " ").strip()
 
 
 def _dd_labels(ins):
@@ -524,10 +521,6 @@ def to_dot(funcs, mode="both"):
 
 
 def to_json(funcs):
-    def conv(o):
-        if isinstance(o, int):
-            return o
-        return o
     data = []
     for fn in funcs:
         h = lambda x: x if x == START else "0x%x" % x
@@ -551,22 +544,41 @@ def to_json(funcs):
     return json.dumps(data, indent=2)
 
 
-def to_text(funcs):
-    """Compact, LLM-friendly listing."""
-    lines = []
+TEXT_LEGEND = ("Legend: D = locations written, U = locations read, DD = addresses of the "
+               "instructions whose values this one reads (START = value on function entry), "
+               "stk_N = stack slot at offset N from esp on entry (stk_4 = 1st stack arg), "
+               "Bk = basic block, '-' = none.")
+
+
+def to_text(funcs, max_instructions=None, legend=False):
+    """Compact, LLM-friendly listing. Stops after max_instructions (total) and says so."""
+    lines = [TEXT_LEGEND, ""] if legend else []
+    total = sum(len(fn["instructions"]) for fn in funcs)
+    shown = 0
     for fn in funcs:
+        if max_instructions is not None and shown >= max_instructions:
+            break
         by_ea = {ins["ea"]: ins for ins in fn["instructions"]}
         names = {b["start"]: "B%d" % k for k, b in enumerate(fn["blocks"])}
         lines.append("function 0x%x  (%d instructions, %d blocks)" %
                      (fn["entry"], len(by_ea), len(fn["blocks"])))
         for b in fn["blocks"]:
+            if max_instructions is not None and shown >= max_instructions:
+                break
             succ = ", ".join("%s(0x%x)" % (names[s], s) for s in b["successors"]) or "none (exit)"
             lines.append("  %s @0x%x -> %s" % (names[b["start"]], b["start"], succ))
             for ea in b["instructions"]:
+                if max_instructions is not None and shown >= max_instructions:
+                    break
                 ins = by_ea[ea]
                 lines.append("    0x%x  %-28s %s  DD: %s" %
-                             (ea, ins["asm"], _du_str(ins), ", ".join(_dd_labels(ins)) or "-"))
+                             (ea, ins["asm"], _du_str(ins, "-" if legend else ""),
+                              ", ".join(_dd_labels(ins)) or "-"))
+                shown += 1
         lines.append("")
+    if shown < total:
+        lines.append("... TRUNCATED: %d more instructions not shown "
+                     "(raise max_instructions, or request a single function)." % (total - shown))
     return "\n".join(lines)
 
 
