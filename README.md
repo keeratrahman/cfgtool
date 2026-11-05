@@ -65,11 +65,14 @@ cp .env.example .env           # macOS / Linux / Windows PowerShell
 copy .env.example .env         # Windows Command Prompt
 ```
 
-Open `.env` in any text editor and replace the placeholder with your key:
+Open `.env` in any text editor. Replace the placeholder with your key, and set `CFG_MODEL` to the number of the model **you** are testing (1, 2 or 3; see [Built-in models](#built-in-models-all-free-all-support-tool-calling)):
 
 ```
 OPENROUTER_API_KEY=sk-or-v1-...
+CFG_MODEL=2
 ```
+
+After that, every run uses your model. The tool never switches to a different model on its own.
 
 `.env` is gitignored, so your key stays on your machine. **Never commit it, and never paste it into chats or issues.** If a key leaks, delete it on OpenRouter and make a new one.
 
@@ -86,11 +89,11 @@ set OPENROUTER_API_KEY=sk-or-v1-...           # Windows Command Prompt
 ## 4. Run
 
 ```bash
-# Ask the default model about a file
+# Ask your model (CFG_MODEL in .env) about a file
 python cfg_agent.py sample.exe "What does the entry function do?"
 
-# Pick one of the three built-in models by number
-python cfg_agent.py --model 2 sample.exe "Which arguments does 0x401020 take?"
+# Use a different model for one run
+python cfg_agent.py --model 3 sample.exe "Which arguments does 0x401020 take?"
 
 # Ask all three models and compare the answers
 python cfg_agent.py --compare sample.exe "Which instructions does 0x40100f depend on?"
@@ -104,7 +107,7 @@ python cfg_agent.py --list-models
 
 Tool calls are printed to stderr as they happen. Add `-q` to hide them.
 
-**If a model is busy or unavailable, the tool automatically tries the next one**, so you normally don't need to do anything. (Add `--no-fallback` to stick to one model.)
+**If your model is busy or unavailable**, the tool retries a few times over about a minute, then tells you. Wait a few minutes and run the same command again.
 
 **If the AI part isn't working at all** (no internet, key problems, daily limit reached), you can still analyze files without AI, using the plain CLI (see [Plain CLI](#plain-cli-no-llm) below). For example: `python cfg_cli.py sample.exe`
 
@@ -122,7 +125,7 @@ Sometimes the tool can't work out the stack layout of a function. When that happ
 
 | # | Model |
 |---|---|
-| 1 (default) | `nvidia/nemotron-3.5-super-vl:free` |
+| 1 | `nvidia/nemotron-3.5-super-vl:free` |
 | 2 | `cohere/north-mini-code:free` |
 | 3 | `nvidia/nemotron-3.5-lightning:free` |
 
@@ -173,13 +176,13 @@ Render a DOT file with: `dot -Tpng out.dot -o out.png`
 | Message | Fix |
 |---|---|
 | `no API key` | Create `.env` (step 3) in the `cfgtool` folder. On Windows, check it isn't saved as `.env.txt`. |
-| `... is rate-limited right now` / `trying the next model` | Normal for free models; the tool switches models by itself. If **all** models are busy, wait a few minutes and try again. |
+| `... is rate-limited right now` / `Your model ... didn't answer` | Normal for free models. Wait a few minutes and run the command again. If it keeps happening for hours, tell Keerat. |
 | `hit its daily limit for free models` | Your OpenRouter account has used up today's free requests (each question uses several). It resets daily. Until then, use `cfg_cli.py` (no AI). |
 | `can't reach OpenRouter` | Check your internet connection. Until then, use `cfg_cli.py` (no AI). |
 | `Unexpected error ... Details saved to cfgtool_errors.log` | A bug in the tool. Send Keerat `cfgtool_errors.log` (in the `cfgtool` folder) and keep working with `cfg_cli.py` or another question. |
-| `... timed out` | The free model is overloaded; the tool tries the next one. If all time out, try again later. |
+| `... timed out` | The free model is overloaded. Wait a few minutes and try again. |
 | `Error code: 401` | Your key is wrong or was deleted. Check `.env`. |
-| `Error code: 404` / `No endpoints found` / `not a valid model ID` | That free model was removed from OpenRouter. The tool moves on to the next model automatically; tell Keerat so the list can be updated. |
+| `Error code: 404` / `No endpoints found` / `not a valid model ID` | That free model was removed from OpenRouter. Tell Keerat so it can be replaced in the list. |
 | `pip install` fails | Check `python3 --version` is 3.10 or newer, and that the virtual environment is active (step 1). Then run `pip install --upgrade pip` and try again. |
 | `ERROR: ...` in the model's answer or tool output | The tool rejected the input. Common causes: a 64-bit file (not supported), a wrong path, or an address outside the file. The model usually retries on its own; if not, fix the file or address and ask again. |
 | A Python traceback (many lines ending in `...Error: ...`) | A bug in the tool that slipped past the error handling. Send Keerat the **full** error text and the exact command you ran. |

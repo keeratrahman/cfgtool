@@ -156,10 +156,9 @@ def main():
                    help="binary file and question (just the question when using --hex)")
     p.add_argument("--hex", help="analyze these hex bytes instead of a file")
     p.add_argument("--model", default=os.environ.get("CFG_MODEL"),
-                   help="1-%d (from MODELS) or an OpenRouter model ID; default: model 1" % len(MODELS))
+                   help="1-%d (from MODELS) or an OpenRouter model ID; default: CFG_MODEL in .env, "
+                        "else model 1" % len(MODELS))
     p.add_argument("--compare", action="store_true", help="ask every model in MODELS and print all answers")
-    p.add_argument("--no-fallback", action="store_true",
-                   help="don't switch to another model if the chosen one fails")
     p.add_argument("--list-models", action="store_true", help="show the built-in models and exit")
     p.add_argument("--max-steps", type=int, default=12)
     p.add_argument("-q", "--quiet", action="store_true", help="don't print tool calls")
@@ -215,21 +214,16 @@ def _main_run(a, q):
                 break
         sys.exit(1 if failed == len(MODELS) or status == "stop" else 0)
 
-    # Single question: if the chosen model fails, automatically try the other built-in models.
-    first = resolve_model(a.model)
-    order = [first] if a.no_fallback else [first] + [m for m in MODELS if m != first]
-    for k, m in enumerate(order):
-        if k:
-            print("[cfgtool] trying the next model: %s" % m, file=sys.stderr)
-        answer, status = ask(m, q, a.max_steps, verbose, waits=(5, 15))
-        if status is None:
-            print(answer)
-            sys.exit(0)
-        print(answer, file=sys.stderr)
-        if status == "stop":
-            sys.exit(1)
-    print("ERROR: none of the models answered. Free models are sometimes all busy; try again in a "
-          "few minutes. " + NO_AI_HINT)
+    model = resolve_model(a.model)
+    answer, status = ask(model, q, a.max_steps, verbose)
+    if status is None:
+        print(answer)
+        sys.exit(0)
+    print(answer, file=sys.stderr)
+    if status == "next":  # this model failed; say what to do without switching models
+        print("Your model (%s) didn't answer. Free models are often busy: wait a few minutes and "
+              "try again. If it keeps failing, tell %s. %s" % (model, DEVELOPER, NO_AI_HINT),
+              file=sys.stderr)
     sys.exit(1)
 
 
