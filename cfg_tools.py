@@ -113,8 +113,12 @@ def list_functions(path, base_address="0x401000", include_unreachable=False, off
     if len(starts) > FUNCTIONS_PER_PAGE:
         lines.append("Showing functions %d-%d of %d." % (offset + 1, offset + len(page), len(starts)))
     for s in page:
-        info = an.analyze_function(s)
-        calls = _calls(an, s)
+        try:
+            info = an.analyze_function(s)
+            calls = _calls(an, s)
+        except Exception as e:  # keep listing the other functions
+            lines.append("0x%x  (analysis failed: %s)" % (s, e))
+            continue
         nwarn = _record(sha, os.path.basename(str(path)), [info])
         lines.append("0x%x  %d instructions, %d blocks, calls: %s%s"
                      % (s, len(info["instructions"]), len(info["blocks"]),

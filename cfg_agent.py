@@ -20,8 +20,8 @@ import os
 import sys
 import time
 
-from openai import (APIConnectionError, APIError, APITimeoutError, InternalServerError, OpenAI,
-                    RateLimitError)
+from openai import (APIConnectionError, APIError, APIStatusError, APITimeoutError,
+                    AuthenticationError, InternalServerError, OpenAI, RateLimitError)
 
 import cfg_tools
 from cfg_tools import TOOL_SCHEMAS, dispatch
@@ -88,13 +88,13 @@ def _complete(client, model, messages, verbose, waits=(5, 15, 30)):
         time.sleep(waits[attempt])
 
 
-def run(model, question, max_steps=12, verbose=True):
+def run(model, question, max_steps=12, verbose=True, waits=(5, 15, 30)):
     client = OpenAI(base_url="https://openrouter.ai/api/v1",
                     api_key=os.environ["OPENROUTER_API_KEY"], timeout=120, max_retries=2)
     messages = [{"role": "system", "content": SYSTEM},
                 {"role": "user", "content": question}]
     for _ in range(max_steps):
-        resp = _complete(client, model, messages, verbose)
+        resp = _complete(client, model, messages, verbose, waits)
         msg = resp.choices[0].message
         if not msg.tool_calls:
             return msg.content or ""
@@ -114,17 +114,33 @@ def run(model, question, max_steps=12, verbose=True):
     return "(stopped after %d tool rounds without a final answer)" % max_steps
 
 
-def ask(model, q, max_steps, verbose):
-    """Run one model; return its answer or a one-line error (never raises API errors)."""
+NO_AI_HINT = ("Meanwhile you can still analyze files without AI: "
+              "python cfg_cli.py FILE  (see README, 'Plain CLI').")
+
+
+def ask(model, q, max_steps, verbose, waits=(5, 15, 30)):
+    """Run one model. Returns (answer, status): status None = ok, 'next' = this model failed
+    but another may work, 'stop' = no model will work (key, quota, network)."""
     try:
-        return run(model, q, max_steps, verbose)
-    except RateLimitError:
-        return ("ERROR: %s is rate-limited right now (common for :free models). "
-                "Try again in a minute or use another model." % model)
-    except APITimeoutError:
-        return "ERROR: %s timed out. Try again or use another model." % model
+        return run(model, q, max_steps, verbose, waits), None
+    except AuthenticationError:
+        return ("ERROR: OpenRouter rejected your API key (401). Check OPENROUTER_API_KEY in .env, "
+                "or make a new key on OpenRouter. " + NO_AI_HINT), "stop"
+    except APIConnectionError as e:
+        if isinstance(e, APITimeoutError):
+            return "ERROR: %s timed out." % model, "next"
+        return ("ERROR: can't reach OpenRouter. Check your internet connection. " + NO_AI_HINT), "stop"
+    except RateLimitError as e:
+        if "per-day" in str(e).lower() or "per day" in str(e).lower():
+            return ("ERROR: your OpenRouter account hit its daily limit for free models. It resets "
+                    "daily. " + NO_AI_HINT), "stop"
+        return "ERROR: %s is rate-limited right now (common for :free models)." % model, "next"
+    except APIStatusError as e:
+        if e.status_code == 402:
+            return ("ERROR: OpenRouter says your account needs credits (402). " + NO_AI_HINT), "stop"
+        return "ERROR from OpenRouter (%s): %s" % (model, e), "next"
     except (APIError, RuntimeError) as e:
-        return "ERROR from OpenRouter (%s): %s" % (model, e)
+        return "ERROR from OpenRouter (%s): %s" % (model, e), "next"
 
 
 def main():
@@ -142,6 +158,8 @@ def main():
     p.add_argument("--model", default=os.environ.get("CFG_MODEL"),
                    help="1-%d (from MODELS) or an OpenRouter model ID; default: model 1" % len(MODELS))
     p.add_argument("--compare", action="store_true", help="ask every model in MODELS and print all answers")
+    p.add_argument("--no-fallback", action="store_true",
+                   help="don't switch to another model if the chosen one fails")
     p.add_argument("--list-models", action="store_true", help="show the built-in models and exit")
     p.add_argument("--max-steps", type=int, default=12)
     p.add_argument("-q", "--quiet", action="store_true", help="don't print tool calls")
@@ -185,18 +203,53 @@ def flush_warnings(model):
 
 
 def _main_run(a, q):
+    verbose = not a.quiet
     if a.compare:
         failed = 0
         for k, m in enumerate(MODELS, 1):
             print("\n===== [%d] %s" % (k, m), flush=True)
-            answer = ask(m, q, a.max_steps, not a.quiet)
-            failed += answer.startswith("ERROR")
+            answer, status = ask(m, q, a.max_steps, verbose)
+            failed += status is not None
             print(answer, flush=True)
-        sys.exit(1 if failed == len(MODELS) else 0)
-    answer = ask(resolve_model(a.model), q, a.max_steps, not a.quiet)
-    print(answer)
-    sys.exit(1 if answer.startswith("ERROR") else 0)
+            if status == "stop":
+                break
+        sys.exit(1 if failed == len(MODELS) or status == "stop" else 0)
+
+    # Single question: if the chosen model fails, automatically try the other built-in models.
+    first = resolve_model(a.model)
+    order = [first] if a.no_fallback else [first] + [m for m in MODELS if m != first]
+    for k, m in enumerate(order):
+        if k:
+            print("[cfgtool] trying the next model: %s" % m, file=sys.stderr)
+        answer, status = ask(m, q, a.max_steps, verbose, waits=(5, 15))
+        if status is None:
+            print(answer)
+            sys.exit(0)
+        print(answer, file=sys.stderr)
+        if status == "stop":
+            sys.exit(1)
+    print("ERROR: none of the models answered. Free models are sometimes all busy; try again in a "
+          "few minutes. " + NO_AI_HINT)
+    sys.exit(1)
+
+
+def _crash(exc):
+    """Unexpected bug: save the details for the developer instead of dumping a traceback."""
+    import traceback
+    log = os.path.join(HERE, "cfgtool_errors.log")
+    with open(log, "a", encoding="utf-8") as f:
+        f.write("=== %s  %s\n" % (datetime.datetime.now().isoformat(timespec="seconds"),
+                                   " ".join(sys.argv)))
+        traceback.print_exception(type(exc), exc, exc.__traceback__, file=f)
+    print("\n[cfgtool] Unexpected error: %s: %s\nDetails saved to %s. Please send this file to %s.\n%s"
+          % (type(exc).__name__, exc, os.path.basename(log), DEVELOPER, NO_AI_HINT), file=sys.stderr)
+    sys.exit(2)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as e:  # noqa: BLE001 - last-resort guard so teammates get a clear message
+        _crash(e)

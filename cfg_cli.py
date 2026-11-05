@@ -43,4 +43,19 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except (OSError, ValueError) as e:  # bad file, bad hex, unsupported PE, ...
+        sys.exit("ERROR: %s" % e)
+    except Exception as e:  # unexpected bug: save details for the developer
+        import datetime
+        import os
+        import traceback
+        log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cfgtool_errors.log")
+        with open(log, "a", encoding="utf-8") as f:
+            f.write("=== %s  %s\n" % (datetime.datetime.now().isoformat(timespec="seconds"), " ".join(sys.argv)))
+            traceback.print_exception(type(e), e, e.__traceback__, file=f)
+        sys.exit("ERROR: unexpected %s: %s\nDetails saved to cfgtool_errors.log. Please send this file to Keerat."
+                 % (type(e).__name__, e))

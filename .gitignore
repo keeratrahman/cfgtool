@@ -4,3 +4,4 @@ __pycache__/
 .venv/
 venv/
 cfgtool_warnings.log
+cfgtool_errors.log

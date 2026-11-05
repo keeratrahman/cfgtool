@@ -104,6 +104,10 @@ python cfg_agent.py --list-models
 
 Tool calls are printed to stderr as they happen. Add `-q` to hide them.
 
+**If a model is busy or unavailable, the tool automatically tries the next one**, so you normally don't need to do anything. (Add `--no-fallback` to stick to one model.)
+
+**If the AI part isn't working at all** (no internet, key problems, daily limit reached), you can still analyze files without AI, using the plain CLI (see [Plain CLI](#plain-cli-no-llm) below). For example: `python cfg_cli.py sample.exe`
+
 ### If you see "stack warnings logged"
 
 Sometimes the tool can't work out the stack layout of a function. When that happens, the run ends with:
@@ -169,13 +173,16 @@ Render a DOT file with: `dot -Tpng out.dot -o out.png`
 | Message | Fix |
 |---|---|
 | `no API key` | Create `.env` (step 3) in the `cfgtool` folder. On Windows, check it isn't saved as `.env.txt`. |
-| `... is rate-limited right now` | Normal for free models. Wait a minute, or use `--model` to pick another model. |
-| `... timed out` | The free model is overloaded. Retry, or pick another model. |
+| `... is rate-limited right now` / `trying the next model` | Normal for free models; the tool switches models by itself. If **all** models are busy, wait a few minutes and try again. |
+| `hit its daily limit for free models` | Your OpenRouter account has used up today's free requests (each question uses several). It resets daily. Until then, use `cfg_cli.py` (no AI). |
+| `can't reach OpenRouter` | Check your internet connection. Until then, use `cfg_cli.py` (no AI). |
+| `Unexpected error ... Details saved to cfgtool_errors.log` | A bug in the tool. Send Keerat `cfgtool_errors.log` (in the `cfgtool` folder) and keep working with `cfg_cli.py` or another question. |
+| `... timed out` | The free model is overloaded; the tool tries the next one. If all time out, try again later. |
 | `Error code: 401` | Your key is wrong or was deleted. Check `.env`. |
-| `Error code: 404` / `No endpoints found` / `not a valid model ID` | That free model was removed from OpenRouter. Use `--model 2` or `--model 3`, and tell Keerat so the list can be updated. |
+| `Error code: 404` / `No endpoints found` / `not a valid model ID` | That free model was removed from OpenRouter. The tool moves on to the next model automatically; tell Keerat so the list can be updated. |
 | `pip install` fails | Check `python3 --version` is 3.10 or newer, and that the virtual environment is active (step 1). Then run `pip install --upgrade pip` and try again. |
 | `ERROR: ...` in the model's answer or tool output | The tool rejected the input. Common causes: a 64-bit file (not supported), a wrong path, or an address outside the file. The model usually retries on its own; if not, fix the file or address and ask again. |
-| A Python traceback (many lines ending in `...Error: ...`) | A bug in the tool. Send Keerat the **full** error text and the exact command you ran. |
+| A Python traceback (many lines ending in `...Error: ...`) | A bug in the tool that slipped past the error handling. Send Keerat the **full** error text and the exact command you ran. |
 | No error, but the answer looks wrong or incomplete | The free model may have misread the output, or the tool may not support that code yet (see Limitations). Try `--compare` or another model, and tell Keerat which sample and function it was. |
 
 ## Limitations
