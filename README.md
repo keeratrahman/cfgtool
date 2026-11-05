@@ -115,6 +115,7 @@ python cfg_cli.py sample.exe --format text
 python cfg_cli.py sample.exe --format dot --mode cfg -o out.dot   # Lab 3 style
 python cfg_cli.py sample.exe --format dot --mode ddg -o out.dot   # Lab 4 style
 python cfg_cli.py --hex "55 8b ec 5d c3" --base 0x401000
+python cfg_cli.py app.exe --format json --sweep                   # include code not reached from the entry
 ```
 
 Render a DOT file with: `dot -Tpng out.dot -o out.png`
