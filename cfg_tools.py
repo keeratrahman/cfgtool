@@ -7,6 +7,7 @@ Designed for small/cheap models:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 
@@ -15,7 +16,22 @@ from capstone import CS_GRP_CALL
 from cfg_core import Analyzer, Image, parse_hex, to_text
 
 DEFAULT_MAX_INSTRUCTIONS = 150
-_CACHE = {}  # (abs path, mtime, base) -> (Analyzer, image, default entries)
+FUNCTIONS_PER_PAGE = 60
+_CACHE = {}  # (abs path, mtime, base) -> (Analyzer, image, default entries, sha256)
+
+# Stack warnings seen this session: (sha256, function address, message) -> file name.
+# cfg_agent.py writes these to a log for the developer.
+WARNINGS = {}
+
+
+def _record(sha, fname, funcs):
+    n = 0
+    for fn in funcs:
+        for w in fn.get("warnings", []):
+            if w.startswith("WARNING"):
+                WARNINGS.setdefault((sha, "0x%x" % fn["entry"], w), fname)
+                n += 1
+    return n
 
 
 # ------------------------------------------------------------------ helpers
@@ -48,7 +64,7 @@ def _load(path, base_address):
         with open(path, "rb") as f:
             data = f.read()
         img, entries = Image.from_bytes(data, base)
-        _CACHE[key] = (Analyzer(img), img, entries)
+        _CACHE[key] = (Analyzer(img), img, entries, hashlib.sha256(data).hexdigest())
     return _CACHE[key]
 
 
@@ -64,7 +80,8 @@ def _calls(an, fn_start):
         i = an.insn(a)
         if i.group(CS_GRP_CALL):
             t = an.direct_target(i)
-            out.append("0x%x" % t if t is not None else "indirect(%s)" % i.op_str)
+            name = an.call_name(a)
+            out.append(name or ("0x%x" % t if t is not None else "indirect(%s)" % i.op_str))
     return list(dict.fromkeys(out))
 
 
@@ -81,21 +98,31 @@ def _safe(fn):
 
 # -------------------------------------------------------------------- tools
 @_safe
-def list_functions(path, base_address="0x401000", include_unreachable=False):
-    """One line per function: address, size, and the functions it calls."""
-    an, img, entries = _load(path, base_address)
+def list_functions(path, base_address="0x401000", include_unreachable=False, offset=0):
+    """One line per function: address, size, and the functions it calls.
+    Shows FUNCTIONS_PER_PAGE functions starting at `offset`."""
+    an, img, entries, sha = _load(path, base_address)
     starts = an.discover(entries, sweep=bool(include_unreachable))
     if not starts:
         return "ERROR: no decodable code at entry %s; image spans %s" % (
             [hex(e) for e in entries], _image_span(img))
+    offset = max(0, int(offset or 0))
+    page = starts[offset:offset + FUNCTIONS_PER_PAGE]
     lines = ["%d functions (entry point: %s). Use get_function(address) for details."
              % (len(starts), ", ".join("0x%x" % e for e in entries))]
-    for s in starts:
+    if len(starts) > FUNCTIONS_PER_PAGE:
+        lines.append("Showing functions %d-%d of %d." % (offset + 1, offset + len(page), len(starts)))
+    for s in page:
         info = an.analyze_function(s)
         calls = _calls(an, s)
-        lines.append("0x%x  %d instructions, %d blocks, calls: %s"
+        nwarn = _record(sha, os.path.basename(str(path)), [info])
+        lines.append("0x%x  %d instructions, %d blocks, calls: %s%s"
                      % (s, len(info["instructions"]), len(info["blocks"]),
-                        ", ".join(calls) if calls else "-"))
+                        ", ".join(calls) if calls else "-",
+                        "  (%d stack warning%s)" % (nwarn, "s" * (nwarn > 1)) if nwarn else ""))
+    if offset + len(page) < len(starts):
+        lines.append("... %d more functions: call list_functions again with offset=%d."
+                     % (len(starts) - offset - len(page), offset + len(page)))
     return "\n".join(lines)
 
 
@@ -104,7 +131,7 @@ def get_function(path, address, base_address="0x401000",
                  format="text", max_instructions=DEFAULT_MAX_INSTRUCTIONS):
     """CFG of one function: basic blocks, edges, defs/uses and data dependencies.
     An address inside a function returns the whole containing function."""
-    an, img, entries = _load(path, base_address)
+    an, img, entries, sha = _load(path, base_address)
     addr = parse_address(address)
     _check_addr(an, img, addr)
     start, note = addr, ""
@@ -116,17 +143,21 @@ def get_function(path, address, base_address="0x401000",
             start = max(owners)
             note = ("NOTE: 0x%x is inside function 0x%x; showing the whole function.\n\n"
                     % (addr, start))
-    return note + _render([an.analyze_function(start)], format, max_instructions)
+    info = an.analyze_function(start)
+    _record(sha, os.path.basename(str(path)), [info])
+    return note + _render([info], format, max_instructions)
 
 
 @_safe
 def analyze_hex(code_hex, base_address="0x401000",
                 format="text", max_instructions=DEFAULT_MAX_INSTRUCTIONS):
     """CFG of a short machine-code snippet given as hex bytes (all functions it calls included)."""
-    img, entries = Image.from_bytes(parse_hex(code_hex), parse_address(base_address))
+    data = parse_hex(code_hex)
+    img, entries = Image.from_bytes(data, parse_address(base_address))
     an = Analyzer(img)
     _check_addr(an, img, entries[0])
     funcs = an.analyze(entries)
+    _record(hashlib.sha256(data).hexdigest(), "(hex snippet)", funcs)
     return _render(funcs, format, max_instructions)
 
 
@@ -159,6 +190,8 @@ TOOL_SCHEMAS = [
             "base_address": _BASE,
             "include_unreachable": {"type": "boolean",
                                     "description": "Also list code not reached from the entry point."},
+            "offset": {"type": "integer",
+                       "description": "Skip this many functions (for paging; default 0)."},
         }, "required": ["path"]}}},
     {"type": "function", "function": {
         "name": "get_function",

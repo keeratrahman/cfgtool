@@ -9,6 +9,7 @@ There are three ways to use it:
 | `cfg_agent.py` | Ask a **free OpenRouter model** a question; the model uses the tool itself. *(Most people want this one.)* |
 | `cfg_mcp_server.py` | The same tools as an MCP server, for Claude Code, Cursor and other MCP clients. |
 | `cfg_cli.py` | Plain command line, no LLM. Outputs text, JSON or Graphviz DOT. |
+| `cfg_check.py` | For the developer: scans samples and reports functions with stack warnings. |
 
 ---
 
@@ -75,6 +76,16 @@ python cfg_agent.py --list-models
 
 Tool calls are printed to stderr as they happen. Add `-q` to hide them.
 
+### If you see "stack warnings logged"
+
+Sometimes the tool can't work out the stack layout of a function. When that happens, the run ends with:
+
+```
+[cfgtool] 2 stack warnings logged in cfgtool_warnings.log. Please send this file to Keerat.
+```
+
+**Please send `cfgtool_warnings.log` (in the `cfgtool` folder) to Keerat.** It contains only the date, the model, the sample's file name and SHA-256, and the function address. It never contains the sample itself. Once you've sent it you can delete it; a new one is created the next time a warning comes up. The answer from that run is still usable, but stack slot names (`stk_N`) in the affected functions may be off.
+
 ### Built-in models (all free, all support tool calling)
 
 | # | Model |
@@ -120,6 +131,9 @@ Render a DOT file with: `dot -Tpng out.dot -o out.png`
 - **DD**: addresses of the earlier instructions whose values this instruction reads. **START** means the value the location had on function entry.
 - **stk_N**: stack slot at offset N from `esp` on function entry. `stk_4` is the first stack argument; negative offsets are locals and saved registers.
 - **B0, B1, …**: basic blocks, each with its successor blocks.
+- **`<kernel32!Sleep>`** after a call: the Windows API being called (resolved from the import table).
+- **`note: assumed call at 0x… pops N bytes`**: the tool corrected its guess for a call so that the function's stack balances. This is informational.
+- **`WARNING: stack …`**: the stack couldn't be balanced, so `stk_N` names after that point may be wrong.
 
 ## Troubleshooting
 
@@ -133,6 +147,20 @@ Render a DOT file with: `dot -Tpng out.dot -o out.png`
 ## Limitations
 
 - **32-bit x86 only.** 64-bit PEs are rejected.
-- **Only direct jumps and calls are followed.** Jump tables (`jmp [eax*4+...]`) and indirect calls (`call eax`, `call [IAT]`) are not resolved, so switch statements and Windows API calls show up as dead ends or `indirect(...)`.
+- **Jump tables aren't followed** (`jmp [eax*4+...]`), so switch statements end in dead ends. Calls through registers or memory that aren't Windows imports (e.g. `call eax`, `call [ecx+8]`) show up as `indirect(...)`.
 - Stack tracking doesn't handle stack alignment (`and esp, -16`) or `mov esp, ...`.
-- The stack-argument count of each called function is a guess, based on `ret N` and `[ebp+8+...]` accesses.
+- How many stack arguments a call takes is worked out from `ret N` (for functions in the binary) or by counting pushes before the call (for Windows APIs and indirect calls). The guess is corrected automatically when the stack doesn't balance; otherwise a warning is shown.
+- The free models sometimes misread correct tool output. Check important answers against the listing, or use `--compare`.
+
+---
+
+## For the developer: checking samples for warnings
+
+`cfg_check.py` analyzes every function in a set of samples and reports which functions have stack warnings. It uses no LLM and no network, and it only reads the files; it never runs them.
+
+```bash
+python cfg_check.py samples/            # every PE under samples/ (recursive)
+python cfg_check.py a.exe b.dll -v      # list each warning, with the sample's SHA-256
+```
+
+Lines in a partner's `cfgtool_warnings.log` are tab-separated: date, model, file name, SHA-256, function address, warning. Match the SHA-256 to your own copy of the sample and run `cfg_check.py` on it to reproduce.

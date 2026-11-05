@@ -17,10 +17,11 @@ mcp = _Server("cfg-builder")
 
 
 @mcp.tool()
-def list_functions(path: str, base_address: str = "0x401000", include_unreachable: bool = False) -> str:
-    """List the functions in a binary file (32-bit x86 PE or raw code). Call this first
-    to get function addresses. base_address only matters for raw (non-PE) files."""
-    return cfg_tools.list_functions(path, base_address, include_unreachable)
+def list_functions(path: str, base_address: str = "0x401000", include_unreachable: bool = False,
+                   offset: int = 0) -> str:
+    """List the functions in a binary file (32-bit x86 PE or raw code), 60 per call. Call this
+    first to get function addresses; use offset to page. base_address only matters for raw files."""
+    return cfg_tools.list_functions(path, base_address, include_unreachable, offset)
 
 
 @mcp.tool()

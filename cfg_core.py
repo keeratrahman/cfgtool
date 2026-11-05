@@ -58,6 +58,7 @@ class Image:
 
     def __init__(self):
         self.segments = []
+        self.imports = {}  # IAT slot address -> "dll!function"
 
     def add(self, base, data, executable=True):
         self.segments.append((base, bytes(data), executable))
@@ -81,8 +82,18 @@ class Image:
                 img = cls()
                 ib = pe.OPTIONAL_HEADER.ImageBase
                 for s in pe.sections:
-                    img.add(ib + s.VirtualAddress, s.get_data(),
+                    sdata = s.get_data()
+                    if 0 < s.Misc_VirtualSize < len(sdata):
+                        sdata = sdata[:s.Misc_VirtualSize]  # drop file-alignment padding
+                    img.add(ib + s.VirtualAddress, sdata,
                             bool(s.Characteristics & 0x20000000))
+                for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []):
+                    dll = entry.dll.decode(errors="replace").lower()
+                    if dll.endswith(".dll"):
+                        dll = dll[:-4]
+                    for imp in entry.imports:
+                        fn = imp.name.decode(errors="replace") if imp.name else "ord%d" % imp.ordinal
+                        img.imports[imp.address] = "%s!%s" % (dll, fn)
                 return img, [ib + pe.OPTIONAL_HEADER.AddressOfEntryPoint]
             except ImportError:
                 raise ValueError("Input looks like a PE file (MZ header) but pefile is not "
@@ -102,6 +113,10 @@ class Analyzer:
         self._items = {}
         self._purge = {}
         self._sig = {}
+        self._code = set()      # every instruction address reached by collect()
+        self._leaders = set()   # function starts, branch targets, and fall-throughs after branches
+        self._api_purge = {}    # "dll!func" -> bytes popped, learned from balanced functions
+        self._call_fix = {}     # call address -> bytes popped, corrected by stack balancing
 
     # ---- decoding -------------------------------------------------------
     def insn(self, ea):
@@ -163,7 +178,14 @@ class Analyzer:
             if a in seen or self.insn(a) is None:
                 continue
             seen.add(a)
-            work.extend(self.successors(a))
+            succ = self.successors(a)
+            nxt = a + self.insn(a).size
+            if succ != [nxt]:
+                self._leaders.update(succ)
+                self._leaders.add(nxt)
+            work.extend(succ)
+        self._code |= seen
+        self._leaders.add(start)
         self._items[start] = sorted(seen)
         return self._items[start]
 
@@ -216,7 +238,118 @@ class Analyzer:
         self._purge[t] = val
         return val
 
-    def change_stack(self, ea, esp, ebp):
+    # ---- calls we can't analyze (imports, call reg, call [mem]) ------------
+    def _prev(self, ea):
+        """Address of the instruction that falls through to ea, if known."""
+        for k in range(1, 16):
+            p = ea - k
+            if p in self._code and self.insn(p).size == k:
+                return p
+        return None
+
+    def _iat_slot(self, op):
+        if op.type == CS_OP_MEM and not op.mem.base and not op.mem.index:
+            a = op.mem.disp & 0xFFFFFFFF
+            if a in self.img.imports:
+                return a
+        return None
+
+    def _regs_written(self, i):
+        try:
+            return [norm_reg(self.cs.reg_name(r)) for r in i.regs_access()[1]]
+        except Exception:
+            return []
+
+    def _touches_esp(self, i):
+        try:
+            read, written = i.regs_access()
+        except Exception:
+            return False
+        return any(norm_reg(self.cs.reg_name(r)) == "esp" for r in list(read) + list(written))
+
+    def call_name(self, ea):
+        """'dll!func' for a call through the IAT: call [IAT], mov reg,[IAT] + call reg,
+        or a call to a `jmp [IAT]` thunk. None otherwise."""
+        i = self.insn(ea)
+        if not i.operands:
+            return None
+        op = i.operands[0]
+        slot = self._iat_slot(op)
+        if slot is not None:
+            return self.img.imports[slot]
+        if op.type == CS_OP_IMM:
+            t = self.insn(op.imm & 0xFFFFFFFF)
+            if t is not None and t.mnemonic == "jmp" and t.operands:
+                slot = self._iat_slot(t.operands[0])
+                if slot is not None:
+                    return self.img.imports[slot]
+            return None
+        if op.type == CS_OP_REG:
+            reg, a = self.rname(op.reg), ea
+            for _ in range(40):
+                a = self._prev(a)
+                if a is None:
+                    break
+                j = self.insn(a)
+                if reg in self._regs_written(j):
+                    if j.mnemonic == "mov" and len(j.operands) == 2:
+                        slot = self._iat_slot(j.operands[1])
+                        if slot is not None:
+                            return self.img.imports[slot]
+                    break
+        return None
+
+    def guess_call(self, ea):
+        """(bytes popped by callee, number of stack args, caller_cleans) for an opaque call.
+        `add esp, N` right after the call means the caller cleans up (cdecl); otherwise
+        assume stdcall and count the pushes right before the call in the same block."""
+        i = self.insn(ea)
+        nxt = self.insn(ea + i.size)
+        if (nxt is not None and nxt.mnemonic == "add" and self.is_reg(nxt, 0, "esp")
+                and len(nxt.operands) > 1 and nxt.operands[1].type == CS_OP_IMM):
+            return 0, max(0, s32(nxt.operands[1].imm)) // 4, True
+        n, a = 0, ea
+        while n < 16 and a not in self._leaders:
+            p = self._prev(a)
+            if p is None:
+                break
+            j = self.insn(p)
+            if j.mnemonic == "push":
+                n += 1
+            elif (j.group(CS_GRP_CALL) or j.group(CS_GRP_JUMP) or j.group(CS_GRP_RET)
+                  or self._touches_esp(j)):
+                break
+            a = p
+        return 4 * n, n, False
+
+    def is_opaque_call(self, ea):
+        """True for calls whose callee we can't analyze (imports, thunks, indirect)."""
+        i = self.insn(ea)
+        if not i.group(CS_GRP_CALL):
+            return False
+        t = self.direct_target(i)
+        return self.call_name(ea) is not None or t is None or self.insn(t) is None
+
+    def call_effect(self, ea, overrides=None):
+        """(bytes popped, number of stack args, register args) for the call at ea."""
+        i = self.insn(ea)
+        if not self.is_opaque_call(ea):
+            t = self.direct_target(i)
+            regs, n = self.callee_signature(t)
+            return self.callee_purge(t), n, regs
+        purge, n, caller_cleans = self.guess_call(ea)
+        if not caller_cleans:
+            name = self.call_name(ea)
+            if overrides and ea in overrides:
+                purge = overrides[ea]
+            elif ea in self._call_fix:
+                purge = self._call_fix[ea]
+            elif name in self._api_purge:
+                purge = self._api_purge[name]
+            n = purge // 4
+        return purge, n, []
+
+    def change_stack(self, ea, esp, ebp, overrides=None):
         i = self.insn(ea)
         m = i.mnemonic
         if m == "leave":
@@ -226,10 +359,7 @@ class Analyzer:
         if m == "push":
             return esp - 4, ebp
         if m == "call":
-            t = self.direct_target(i)
-            if t is not None and self.insn(t) is not None:
-                return esp + self.callee_purge(t), ebp
-            return esp, ebp
+            return esp + self.call_effect(ea, overrides)[0], ebp
         if m == "mov" and self.is_reg(i, 0, "ebp") and self.is_reg(i, 1, "esp"):
             return esp, esp
         if (m in ("add", "sub") and self.is_reg(i, 0, "esp")
@@ -238,17 +368,58 @@ class Analyzer:
             return (esp + imm if m == "add" else esp - imm), ebp
         return esp, ebp
 
-    def stack_states(self, start, items):
-        itemset, state, work = set(items), {}, [(start, 0, None)]
+    def _stack_pass(self, start, items, overrides):
+        """One stack-height propagation. Returns (state, problems); a problem is
+        (kind, ea, esp_a, esp_b): 'merge' = paths disagree, 'ret' = esp != 0 at ret."""
+        itemset, state, work, problems = set(items), {}, [(start, 0, None)], []
         while work:
             ea, esp, ebp = work.pop()
             if ea in state:
+                if esp is not None and state[ea][0] is not None and state[ea][0] != esp:
+                    problems.append(("merge", ea, state[ea][0], esp))
                 continue
             state[ea] = (esp, ebp)
-            nesp, nebp = self.change_stack(ea, esp, ebp)
+            nesp, nebp = self.change_stack(ea, esp, ebp, overrides)
             for d in self.dests(itemset, ea):
                 work.append((d, nesp, nebp))
-        return state
+        for ea in items:
+            if self.insn(ea).group(CS_GRP_RET) and ea in state and state[ea][0] not in (0, None):
+                problems.append(("ret", ea, state[ea][0], 0))
+        return state, problems
+
+    def stack_states(self, start, items):
+        """Stack heights per instruction, plus warnings. If the heights don't balance,
+        try correcting the pop count of one opaque call (see guess_call) until they do."""
+        state, problems = self._stack_pass(start, items, {})
+        if problems:
+            deltas = []
+            for kind, _, a, b in problems:
+                deltas += [b - a] if kind == "ret" else [a - b, b - a]
+            deltas = [d for d in dict.fromkeys(deltas) if d]
+            opaque = [ea for ea in items if self.is_opaque_call(ea)]
+            for c in opaque:
+                base = self.call_effect(c)[0]
+                for d in deltas:
+                    trial = {c: base + d}
+                    if trial[c] < 0 or trial[c] > 64:
+                        continue
+                    st, pr = self._stack_pass(start, items, trial)
+                    if not pr:
+                        self._call_fix[c] = trial[c]
+                        name = self.call_name(c)
+                        if name:  # reuse at every other call site of this API
+                            self._api_purge[name] = trial[c]
+                        return st, ["note: assumed call at 0x%x pops %d bytes (balances the "
+                                    "function)" % (c, trial[c])]
+        warnings = []
+        for kind, ea, a, b in problems:
+            if kind == "merge":
+                warnings.append("WARNING: stack height differs where paths meet at 0x%x (%d vs %d); "
+                                "stk_N names from here on may be wrong" % (ea, a, b))
+            else:
+                warnings.append("WARNING: stack not balanced at ret 0x%x (esp = %d, expected 0); "
+                                "stk_N names may be wrong" % (ea, a))
+        return state, warnings
 
     # ---- memory operand naming (Lab 3 memoryGetName + Lab 4 mem_address) --
     def mem_name(self, op, esp, ebp):
@@ -284,6 +455,8 @@ class Analyzer:
         m = i.mnemonic
         base_m = m.split()[-1]  # "rep stosd" -> "stosd"
 
+        if base_m == "nop":  # multi-byte nops have a memory operand but touch nothing
+            return [], []
         if base_m in ("stosd", "stosw", "stosb"):  # edge case from the plugins
             d, u = ["[edi]", "edi"], ["eax", "edi"]
             if m.startswith("rep") or X86_PREFIX_REP in i.prefix or X86_PREFIX_REPNE in i.prefix:
@@ -342,14 +515,12 @@ class Analyzer:
             add_unique(d, "esp")
             add_unique(u, "esp")
             add_unique(d, "eax")
-            t = self.direct_target(i)
-            if t is not None and self.insn(t) is not None:
-                regs, nstack = self.callee_signature(t)
-                for r in regs:
-                    add_unique(u, r)
-                if esp is not None:
-                    for k in range(nstack):
-                        add_unique(u, "stk_%d" % (esp + 4 * k))
+            _, nstack, regs = self.call_effect(ea)
+            for r in regs:
+                add_unique(u, r)
+            if esp is not None:
+                for k in range(nstack):
+                    add_unique(u, "stk_%d" % (esp + 4 * k))
         return d, u
 
     def callee_signature(self, t):
@@ -455,14 +626,21 @@ class Analyzer:
     def analyze_function(self, start):
         items = self.collect(start)
         itemset = set(items)
-        stack = self.stack_states(start, items)
+        stack, warnings = self.stack_states(start, items)
         duvals = {ea: self.du(ea, *stack.get(ea, (None, None))) for ea in items}
         deps = self.data_dependencies(start, items, duvals)
         succ = {ea: self.dests(itemset, ea) for ea in items}
+
+        def asm(ea):
+            i = self.insn(ea)
+            name = self.call_name(ea) if i.group(CS_GRP_CALL) or i.group(CS_GRP_JUMP) else None
+            return self.asm(i) + (" <%s>" % name if name else "")
+
         return {
             "entry": start,
+            "warnings": warnings,
             "instructions": [{
-                "ea": ea, "asm": self.asm(self.insn(ea)),
+                "ea": ea, "asm": asm(ea),
                 "defs": duvals[ea][0], "uses": duvals[ea][1],
                 "deps": sorted(deps[ea], key=lambda x: (x != START, x if x != START else 0)),
                 "succ": succ[ea], "esp": stack.get(ea, (None, None))[0],
@@ -526,6 +704,7 @@ def to_json(funcs):
         h = lambda x: x if x == START else "0x%x" % x
         data.append({
             "function": "0x%x" % fn["entry"],
+            "warnings": fn.get("warnings", []),
             "blocks": [{
                 "start": "0x%x" % b["start"],
                 "successors": ["0x%x" % s for s in b["successors"]],
@@ -562,6 +741,8 @@ def to_text(funcs, max_instructions=None, legend=False):
         names = {b["start"]: "B%d" % k for k, b in enumerate(fn["blocks"])}
         lines.append("function 0x%x  (%d instructions, %d blocks)" %
                      (fn["entry"], len(by_ea), len(fn["blocks"])))
+        for w in fn.get("warnings", []):
+            lines.append("  " + w)
         for b in fn["blocks"]:
             if max_instructions is not None and shown >= max_instructions:
                 break

@@ -15,6 +15,7 @@ Examples:
 --model also accepts any OpenRouter model ID (https://openrouter.ai/models, filter by "Tools").
 """
 import argparse
+import datetime
 import os
 import sys
 import time
@@ -22,7 +23,12 @@ import time
 from openai import (APIConnectionError, APIError, APITimeoutError, InternalServerError, OpenAI,
                     RateLimitError)
 
+import cfg_tools
 from cfg_tools import TOOL_SCHEMAS, dispatch
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+WARNING_LOG = os.path.join(HERE, "cfgtool_warnings.log")
+DEVELOPER = "Keerat"  # who to send the warning log to
 
 TRANSIENT = (RateLimitError, APITimeoutError, APIConnectionError, InternalServerError)
 
@@ -152,6 +158,27 @@ def main():
             p.error("file not found: %s" % a.args[0])
         q = "Binary file path: %s\n\n%s" % (os.path.abspath(a.args[0]), " ".join(a.args[1:]))
 
+    try:
+        _main_run(a, q)
+    finally:
+        flush_warnings("compare" if a.compare else resolve_model(a.model))
+
+
+def flush_warnings(model):
+    """Append this run's stack warnings to the log (sample SHA-256, never its contents)."""
+    if not cfg_tools.WARNINGS:
+        return
+    stamp = datetime.datetime.now().isoformat(timespec="seconds")
+    with open(WARNING_LOG, "a") as f:
+        for (sha, func, msg), fname in cfg_tools.WARNINGS.items():
+            f.write("\t".join([stamp, str(model), fname, sha, func, msg]) + "\n")
+    n = len(cfg_tools.WARNINGS)
+    sys.stdout.flush()
+    print("\n[cfgtool] %d stack warning%s logged in %s. Please send this file to %s."
+          % (n, "s" * (n > 1), os.path.basename(WARNING_LOG), DEVELOPER), file=sys.stderr)
+
+
+def _main_run(a, q):
     if a.compare:
         failed = 0
         for k, m in enumerate(MODELS, 1):
