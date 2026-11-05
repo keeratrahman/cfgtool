@@ -41,7 +41,15 @@ Windows problems?
 
 Make an account on [OpenRouter](https://openrouter.ai). Once you do that, it will prompt you with a key. Copy the key; you will put it in your `.env` file in step 3. If you lose it, just generate a new key. You can set a spending limit on it if you want. No credit card is needed, because we use free models.
 
-**Use your own key, not someone else's.** Each account has its own daily limit.
+**Use your own key, not someone else's.** Each account has its own daily limit (see below).
+
+### The daily limit
+
+- A free OpenRouter account gets **50 AI requests per day**.
+- One verdict run uses about **5–10 requests**, so you get roughly **5–10 runs per day**. A verdict on each of your 3 file versions fits, with some room to spare.
+- The limit **resets at midnight UTC** (7 PM US Eastern time in winter, 8 PM in summer).
+- When you run out, the tool says `hit its daily limit for free models`. Wait for the reset, or use `cfg_cli.py` (no AI) in the meantime.
+- Optional: an account that has bought at least 10 credits gets 1,000 free-model requests per day. This costs money and isn't needed for our testing.
 
 ### Step 3: Create your `.env` file
 
@@ -132,7 +140,7 @@ python cfg_agent.py -q sample.exe
 
 While it works, you'll see lines like `[tool] list_functions(...)`. That's the model using the tool. The answer is printed at the end.
 
-**Free accounts get a limited number of AI requests per day,** and one verdict run uses several (often 5–10). Plan your testing so you don't run out halfway through. If you do, the tool tells you, and the limit resets the next day.
+**Remember the daily limit:** 50 requests per day, and a verdict run uses about 5–10 of them (see [The daily limit](#the-daily-limit)). Plan your testing so you don't run out halfway through.
 
 **Can't use the AI right now?** (no internet, key problem, daily limit) You can still look at a file's code without AI:
 
@@ -148,7 +156,7 @@ python cfg_cli.py sample.exe
 |---|---|
 | `no API key` | Your `.env` file is missing or misnamed (step 3). On Windows, check it isn't called `.env.txt`. |
 | `rate-limited`, `timed out`, or `Your model ... didn't answer` | Free models are often busy. Wait a few minutes and run the same command again. If it keeps happening for hours, tell Keerat. |
-| `daily limit for free models` | You've used up today's free questions. It resets daily. Until then, use `python cfg_cli.py sample.exe`. |
+| `daily limit for free models` | You've used today's 50 free requests. The limit resets at midnight UTC (7 PM US Eastern in winter). Until then, use `python cfg_cli.py sample.exe`. |
 | `can't reach OpenRouter` | Check your internet connection. |
 | `rejected your API key` / `Error code: 401` | Your key is wrong or was deleted. Check `.env`, or make a new key. |
 | `Error code: 404` / `No endpoints found` | Your model was removed from OpenRouter. Tell Keerat. |
