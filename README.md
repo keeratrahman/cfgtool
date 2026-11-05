@@ -15,15 +15,34 @@ There are three ways to use it:
 
 ## 1. Setup
 
-You need Python 3.10 or newer.
+You need Python 3.10 or newer and Git.
+
+**macOS / Linux:**
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/keeratrahman/cfgtool.git
 cd cfgtool
 python3 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+**Windows (PowerShell):**
+
+```powershell
+git clone https://github.com/keeratrahman/cfgtool.git
+cd cfgtool
+py -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+- If `py` isn't found, use `python`. If neither works, install Python from [python.org](https://www.python.org/downloads/) and tick **"Add python.exe to PATH"** during setup.
+- If PowerShell says *running scripts is disabled on this system*, run this once and then activate again:
+  `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
+- In Command Prompt (cmd) instead of PowerShell, activate with `.venv\Scripts\activate.bat`.
+
+Activate the virtual environment again (the activate line above) each time you open a new terminal. On Windows, use `python` instead of `python3` in all the commands below.
 
 ## 2. Get an OpenRouter API key
 
@@ -42,10 +61,11 @@ pip install -r requirements.txt
 ## 3. Put your key in `.env`
 
 ```bash
-cp .env.example .env
+cp .env.example .env           # macOS / Linux / Windows PowerShell
+copy .env.example .env         # Windows Command Prompt
 ```
 
-Open `.env` and replace the placeholder with your key:
+Open `.env` in any text editor and replace the placeholder with your key:
 
 ```
 OPENROUTER_API_KEY=sk-or-v1-...
@@ -53,7 +73,15 @@ OPENROUTER_API_KEY=sk-or-v1-...
 
 `.env` is gitignored, so your key stays on your machine. **Never commit it, and never paste it into chats or issues.** If a key leaks, delete it on OpenRouter and make a new one.
 
-(You can also `export OPENROUTER_API_KEY=...` in your shell instead; a shell variable takes priority over `.env`.)
+> **Windows / Notepad:** make sure the file is saved as `.env`, not `.env.txt`. In Notepad's *Save as* dialog, set "Save as type" to **All files**. To check, run `dir` (cmd) or `ls` (PowerShell) in the `cfgtool` folder and look for `.env` with no `.txt` at the end.
+
+You can also set the key in your shell instead of using `.env`; a shell variable takes priority over `.env`. It only lasts until you close the terminal:
+
+```
+export OPENROUTER_API_KEY=sk-or-v1-...        # macOS / Linux
+$env:OPENROUTER_API_KEY="sk-or-v1-..."        # Windows PowerShell
+set OPENROUTER_API_KEY=sk-or-v1-...           # Windows Command Prompt
+```
 
 ## 4. Run
 
@@ -140,7 +168,7 @@ Render a DOT file with: `dot -Tpng out.dot -o out.png`
 
 | Message | Fix |
 |---|---|
-| `no API key` | Create `.env` (step 3) in the `cfgtool` folder. |
+| `no API key` | Create `.env` (step 3) in the `cfgtool` folder. On Windows, check it isn't saved as `.env.txt`. |
 | `... is rate-limited right now` | Normal for free models. Wait a minute, or use `--model` to pick another model. |
 | `... timed out` | The free model is overloaded. Retry, or pick another model. |
 | `Error code: 401` | Your key is wrong or was deleted. Check `.env`. |

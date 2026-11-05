@@ -44,7 +44,7 @@ MODELS = [
 def load_dotenv(path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")):
     """Minimal .env reader (KEY=value lines). Real environment variables win."""
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8-sig") as f:  # -sig: ignore the BOM Notepad may add
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
@@ -128,6 +128,12 @@ def ask(model, q, max_steps, verbose):
 
 
 def main():
+    # Windows: never crash when printing characters the console/file encoding can't show
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     load_dotenv()
     p = argparse.ArgumentParser(description="Ask free OpenRouter models about x86-32 code using the CFG tools.")
     p.add_argument("args", nargs="*", metavar="[FILE] QUESTION",
@@ -169,7 +175,7 @@ def flush_warnings(model):
     if not cfg_tools.WARNINGS:
         return
     stamp = datetime.datetime.now().isoformat(timespec="seconds")
-    with open(WARNING_LOG, "a") as f:
+    with open(WARNING_LOG, "a", encoding="utf-8") as f:
         for (sha, func, msg), fname in cfg_tools.WARNINGS.items():
             f.write("\t".join([stamp, str(model), fname, sha, func, msg]) + "\n")
     n = len(cfg_tools.WARNINGS)
