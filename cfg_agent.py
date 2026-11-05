@@ -6,7 +6,9 @@ Setup:
   cp .env.example .env        # then put YOUR OpenRouter key in .env
 
 Examples:
-  python cfg_agent.py sample.exe "What does the entry function do?"        # default model
+  python cfg_agent.py sample.exe                                           # verdict: malicious code?
+  python cfg_agent.py sample.exe "What does the entry function do?"        # your own question
+  python cfg_agent.py --verdict sample.exe "Look at 0x401000"              # question + verdict
   python cfg_agent.py --model 2 sample.exe "..."                           # model #2 from MODELS
   python cfg_agent.py --compare sample.exe "..."                           # ask all 3 models
   python cfg_agent.py --hex "55 8b ec 8b 45 08 5d c3" "What does this return?"
@@ -68,13 +70,38 @@ Rules:
 - If a tool returns "ERROR: ...", read it, fix the arguments and try again.
 - Base your answer only on tool output. Cite instruction addresses."""
 
+VERDICT_QUESTION = "Has malicious code been put into this program? Analyze it and give your verdict."
 
-def _complete(client, model, messages, verbose, waits=(5, 15, 30)):
+VERDICT_INSTRUCTIONS = """
+How to decide:
+- Call list_functions, then list_functions again with include_unreachable=true:
+  injected code is often not reachable from the normal entry point.
+- Look at functions that call Windows APIs used by malware (memory allocation/protection,
+  writing to other processes, creating threads or processes, network, registry, files,
+  LoadLibrary/GetProcAddress) and inspect them with get_function.
+- Signs that code is hidden or obfuscated: many indirect(...) calls or jumps to computed
+  addresses, loops that decode or copy bytes and then jump to them, huge functions with many
+  dead ends, junk instructions, or almost no code at all where a real program should be.
+  A program that is simply small is NOT obfuscated.
+- If you can see the code and nothing in it is malicious, answer CLEAN. Do not call a file
+  SUSPICIOUS just because it is small or because you cannot rule everything out.
+- If the real code is hidden, that is NOT evidence that the file is clean: answer UNSURE or
+  SUSPICIOUS, not CLEAN.
+
+End your reply with exactly this block (fill in the parts in <>):
+VERDICT: <MALICIOUS | SUSPICIOUS | CLEAN | UNSURE>
+CONFIDENCE: <LOW | MEDIUM | HIGH>
+EVIDENCE:
+- <function or instruction address>: <what you found>
+OBFUSCATION: <NONE SEEN | what you saw>"""
+
+
+def _complete(client, model, messages, verbose, waits=(5, 15, 30), tool_choice="auto"):
     """Chat completion with backoff: free models are often rate-limited (429) or slow."""
     for attempt in range(len(waits) + 1):
         try:
             resp = client.chat.completions.create(model=model, messages=messages,
-                                                  tools=TOOL_SCHEMAS, tool_choice="auto")
+                                                  tools=TOOL_SCHEMAS, tool_choice=tool_choice)
             if resp.choices:
                 return resp
             e = RuntimeError("empty response from provider")
@@ -88,7 +115,7 @@ def _complete(client, model, messages, verbose, waits=(5, 15, 30)):
         time.sleep(waits[attempt])
 
 
-def run(model, question, max_steps=12, verbose=True, waits=(5, 15, 30)):
+def run(model, question, max_steps=12, verbose=True, waits=(5, 15, 30), need_verdict=False):
     client = OpenAI(base_url="https://openrouter.ai/api/v1",
                     api_key=os.environ["OPENROUTER_API_KEY"], timeout=120, max_retries=2)
     messages = [{"role": "system", "content": SYSTEM},
@@ -97,7 +124,10 @@ def run(model, question, max_steps=12, verbose=True, waits=(5, 15, 30)):
         resp = _complete(client, model, messages, verbose, waits)
         msg = resp.choices[0].message
         if not msg.tool_calls:
-            return msg.content or ""
+            answer = msg.content or ""
+            if need_verdict and "VERDICT:" not in answer.upper():
+                answer = _ask_for_verdict(client, model, messages, answer, verbose, waits)
+            return answer
         messages.append({"role": "assistant", "content": msg.content or "",
                          "tool_calls": [{"id": tc.id, "type": "function",
                                          "function": {"name": tc.function.name,
@@ -111,18 +141,52 @@ def run(model, question, max_steps=12, verbose=True, waits=(5, 15, 30)):
                 print("       -> %d chars%s" % (len(result), ", ERROR" if result.startswith("ERROR") else ""),
                       file=sys.stderr)
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-    return "(stopped after %d tool rounds without a final answer)" % max_steps
+    # Out of tool rounds: ask for a final answer based on what it has seen so far.
+    if verbose:
+        print("[cfgtool] tool-call limit (%d) reached; asking for a final answer" % max_steps,
+              file=sys.stderr)
+    messages.append({"role": "user", "content": "Stop using tools now and give your final answer"
+                     + (" ending with the VERDICT block." if need_verdict else ".")})
+    try:
+        msg = _complete(client, model, messages, verbose, waits, tool_choice="none").choices[0].message
+        answer = msg.content or ""
+    except (APIError, RuntimeError):
+        answer = ""
+    if not answer.strip():
+        return "(stopped after %d tool rounds without a final answer)" % max_steps
+    if need_verdict and "VERDICT:" not in answer.upper():
+        answer = _ask_for_verdict(client, model, messages, answer, verbose, waits)
+    return answer
+
+
+def _ask_for_verdict(client, model, messages, answer, verbose, waits):
+    """The model answered without the VERDICT block: ask once more for just the block."""
+    if verbose:
+        print("[cfgtool] answer had no VERDICT block; asking the model for it", file=sys.stderr)
+    messages = messages + [
+        {"role": "assistant", "content": answer},
+        {"role": "user", "content": "Now give only the final block, in exactly this format:\n"
+                                    + VERDICT_INSTRUCTIONS.split("End your reply with exactly this "
+                                                                 "block (fill in the parts in <>):\n")[1]}]
+    try:
+        msg = _complete(client, model, messages, verbose, waits, tool_choice="none").choices[0].message
+        block = (msg.content or "").strip()
+    except (APIError, RuntimeError):
+        block = ""
+    if "VERDICT:" in block.upper():
+        return answer.rstrip() + "\n\n" + block
+    return answer.rstrip() + "\n\nVERDICT: (the model did not give one)"
 
 
 NO_AI_HINT = ("Meanwhile you can still analyze files without AI: "
               "python cfg_cli.py FILE  (see README, 'Plain CLI').")
 
 
-def ask(model, q, max_steps, verbose, waits=(5, 15, 30)):
+def ask(model, q, max_steps, verbose, waits=(5, 15, 30), need_verdict=False):
     """Run one model. Returns (answer, status): status None = ok, 'next' = this model failed
     but another may work, 'stop' = no model will work (key, quota, network)."""
     try:
-        return run(model, q, max_steps, verbose, waits), None
+        return run(model, q, max_steps, verbose, waits, need_verdict), None
     except AuthenticationError:
         return ("ERROR: OpenRouter rejected your API key (401). Check OPENROUTER_API_KEY in .env, "
                 "or make a new key on OpenRouter. " + NO_AI_HINT), "stop"
@@ -160,6 +224,8 @@ def main():
                         "else model 1" % len(MODELS))
     p.add_argument("--compare", action="store_true", help="ask every model in MODELS and print all answers")
     p.add_argument("--list-models", action="store_true", help="show the built-in models and exit")
+    p.add_argument("--verdict", action="store_true",
+                   help="end the answer with a VERDICT block (automatic when no question is given)")
     p.add_argument("--max-steps", type=int, default=12)
     p.add_argument("-q", "--quiet", action="store_true", help="don't print tool calls")
     a = p.parse_args()
@@ -171,15 +237,17 @@ def main():
     if not os.environ.get("OPENROUTER_API_KEY"):
         p.error("no API key: put OPENROUTER_API_KEY=sk-or-... in .env (see .env.example) or export it")
     if a.hex:
-        if not a.args:
-            p.error("give a question")
-        q = "Machine code (hex, load address 0x401000): %s\n\n%s" % (a.hex, " ".join(a.args))
+        question = " ".join(a.args)
+        q = "Machine code (hex, load address 0x401000): %s\n\n" % a.hex
     else:
-        if len(a.args) < 2:
-            p.error("give a file and a question (or use --hex)")
+        if len(a.args) < 1:
+            p.error("give a file (and optionally a question), or use --hex")
         if not os.path.isfile(a.args[0]):
             p.error("file not found: %s" % a.args[0])
-        q = "Binary file path: %s\n\n%s" % (os.path.abspath(a.args[0]), " ".join(a.args[1:]))
+        question = " ".join(a.args[1:])
+        q = "Binary file path: %s\n\n" % os.path.abspath(a.args[0])
+    a.verdict = a.verdict or not question  # no question = "is this malicious?" verdict
+    q += (question or VERDICT_QUESTION) + (VERDICT_INSTRUCTIONS if a.verdict else "")
 
     try:
         _main_run(a, q)
@@ -207,7 +275,7 @@ def _main_run(a, q):
         failed = 0
         for k, m in enumerate(MODELS, 1):
             print("\n===== [%d] %s" % (k, m), flush=True)
-            answer, status = ask(m, q, a.max_steps, verbose)
+            answer, status = ask(m, q, a.max_steps, verbose, need_verdict=a.verdict)
             failed += status is not None
             print(answer, flush=True)
             if status == "stop":
@@ -215,7 +283,7 @@ def _main_run(a, q):
         sys.exit(1 if failed == len(MODELS) or status == "stop" else 0)
 
     model = resolve_model(a.model)
-    answer, status = ask(model, q, a.max_steps, verbose)
+    answer, status = ask(model, q, a.max_steps, verbose, need_verdict=a.verdict)
     if status is None:
         print(answer)
         sys.exit(0)

@@ -85,28 +85,54 @@ source .venv/bin/activate      # Mac / Linux
 .venv\Scripts\Activate.ps1     # Windows PowerShell
 ```
 
-Then ask a question about a file:
+### Get a verdict: has malicious code been put in?
+
+Give just the file name:
 
 ```bash
-python cfg_agent.py sample.exe "What does the entry function do?"
+python cfg_agent.py sample.exe
 ```
 
 (On Mac/Linux, use `python3` if `python` isn't found.)
 
-More examples:
+The model explores the program with the tool, explains what it found, and ends with a verdict block like this:
+
+```
+VERDICT: SUSPICIOUS
+CONFIDENCE: MEDIUM
+EVIDENCE:
+- 0x401a20: allocates executable memory and copies bytes into it
+- 0x401b00: calls CreateRemoteThread
+OBFUSCATION: many indirect calls; possibly packed
+```
+
+| Line | Meaning |
+|---|---|
+| `VERDICT` | `MALICIOUS`, `SUSPICIOUS`, `CLEAN`, or `UNSURE` (couldn't see enough of the code to decide). |
+| `CONFIDENCE` | How sure the model is: `LOW`, `MEDIUM`, or `HIGH`. |
+| `EVIDENCE` | Addresses and what the model found there. |
+| `OBFUSCATION` | Whether the model thinks the code is hidden or obfuscated. |
+
+**When testing your 3 versions of the file**, run this same command on each version and record the `VERDICT`, `CONFIDENCE` and `OBFUSCATION` lines. Don't expect correct verdicts on the obfuscated versions yet; what matters is recording what the model says. Worse answers on obfuscated files are expected. Crashes and error logs are not; send those to Keerat.
+
+### Ask your own question
 
 ```bash
-# Ask about a specific function
 python cfg_agent.py sample.exe "Which Windows APIs does the function at 0x401000 call?"
 
-# Ask about a few hex bytes instead of a file
+# Your own question, plus a verdict block at the end
+python cfg_agent.py --verdict sample.exe "Look closely at the function at 0x401000"
+
+# A few hex bytes instead of a file
 python cfg_agent.py --hex "55 8b ec 8b 45 08 5d c3" "What does this function return?"
 
 # Hide the tool-call messages and show only the answer
-python cfg_agent.py -q sample.exe "How many functions are there?"
+python cfg_agent.py -q sample.exe
 ```
 
 While it works, you'll see lines like `[tool] list_functions(...)`. That's the model using the tool. The answer is printed at the end.
+
+**Free accounts get a limited number of AI requests per day,** and one verdict run uses several (often 5–10). Plan your testing so you don't run out halfway through. If you do, the tool tells you, and the limit resets the next day.
 
 **Can't use the AI right now?** (no internet, key problem, daily limit) You can still look at a file's code without AI:
 
