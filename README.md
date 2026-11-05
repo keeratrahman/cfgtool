@@ -144,6 +144,11 @@ Render a DOT file with: `dot -Tpng out.dot -o out.png`
 | `... is rate-limited right now` | Normal for free models. Wait a minute, or use `--model` to pick another model. |
 | `... timed out` | The free model is overloaded. Retry, or pick another model. |
 | `Error code: 401` | Your key is wrong or was deleted. Check `.env`. |
+| `Error code: 404` / `No endpoints found` / `not a valid model ID` | That free model was removed from OpenRouter. Use `--model 2` or `--model 3`, and tell Keerat so the list can be updated. |
+| `pip install` fails | Check `python3 --version` is 3.10 or newer, and that the virtual environment is active (step 1). Then run `pip install --upgrade pip` and try again. |
+| `ERROR: ...` in the model's answer or tool output | The tool rejected the input. Common causes: a 64-bit file (not supported), a wrong path, or an address outside the file. The model usually retries on its own; if not, fix the file or address and ask again. |
+| A Python traceback (many lines ending in `...Error: ...`) | A bug in the tool. Send Keerat the **full** error text and the exact command you ran. |
+| No error, but the answer looks wrong or incomplete | The free model may have misread the output, or the tool may not support that code yet (see Limitations). Try `--compare` or another model, and tell Keerat which sample and function it was. |
 
 ## Limitations
 
