@@ -12,6 +12,12 @@ Each of us tests **one** AI model. Follow the steps below once, then go to [Aski
 
 You need **Python 3.10 or newer** and **Git**.
 
+**Before you clone:** this repo is private.
+1. Accept the collaborator invite from GitHub (check your email or [github.com/notifications](https://github.com/notifications)). Until you do, `git clone` says *"repository not found"*.
+2. Make sure Git can sign in to GitHub. Your normal GitHub password **won't** work when Git asks for one.
+   - **Windows:** nothing to do. The first `git clone` opens a browser window to sign in.
+   - **Mac / Linux:** install the [GitHub CLI](https://cli.github.com) and run `gh auth login` once (choose HTTPS and "Login with a web browser"). Or create a [personal access token](https://github.com/settings/tokens) with the `repo` scope and paste it when Git asks for your password.
+
 **Mac / Linux:**
 
 ```bash
