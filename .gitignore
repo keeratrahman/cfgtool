@@ -5,3 +5,4 @@ __pycache__/
 venv/
 cfgtool_warnings.log
 cfgtool_errors.log
+.DS_Store

@@ -7,13 +7,14 @@ Examples:
   python cfg_check.py samples/                 # every PE file under samples/ (recursive)
   python cfg_check.py a.exe b.dll -v           # also print each warning
   python cfg_check.py raw.bin --base 0x10000   # raw code (files given by name only)
+  python cfg_check.py prog.com --bits 16 --base 0x100
 """
 import argparse
 import hashlib
 import os
 import sys
 
-from cfg_core import Analyzer, Image, parse_addr
+from cfg_core import Analyzer, Image, parse_addr, parse_bits
 
 
 def iter_files(paths):
@@ -33,10 +34,10 @@ def iter_files(paths):
             yield p
 
 
-def check(path, base, sweep):
+def check(path, base, sweep, bits=None):
     with open(path, "rb") as f:
         data = f.read()
-    img, entries = Image.from_bytes(data, base)
+    img, entries = Image.from_bytes(data, base, bits)
     an = Analyzer(img)
     funcs = an.analyze(entries, sweep)
     warn = [(fn["entry"], w) for fn in funcs for w in fn["warnings"] if w.startswith("WARNING")]
@@ -48,6 +49,8 @@ def main():
     p = argparse.ArgumentParser(description="Report stack warnings across samples.")
     p.add_argument("paths", nargs="+", help="files and/or folders")
     p.add_argument("--base", default="0x401000", type=parse_addr, help="load address for raw files")
+    p.add_argument("--bits", type=parse_bits, choices=[16, 32, 64],
+                   help="code width for raw files (default 32); PE and DOS files set their own")
     p.add_argument("--sweep", action="store_true", help="also analyze code not reachable from the entry")
     p.add_argument("-v", "--verbose", action="store_true", help="print every warning")
     a = p.parse_args()
@@ -58,7 +61,7 @@ def main():
         if name.startswith(".."):
             name = path
         try:
-            sha, nfuncs, notes, warn = check(path, a.base, a.sweep)
+            sha, nfuncs, notes, warn = check(path, a.base, a.sweep, a.bits)
         except Exception as e:
             print("%-40s ERROR: %s" % (name, e))
             errors += 1

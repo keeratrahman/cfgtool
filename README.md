@@ -1,6 +1,6 @@
 # cfgtool
 
-cfgtool lets an AI model answer questions about 32-bit Windows programs. You ask a question about a file, and the model uses this tool to read the program's code: its functions, control flow, and which instructions depend on which.
+cfgtool lets an AI model answer questions about x86 programs: 32-bit and 64-bit Windows programs, and 16-bit DOS programs. You ask a question about a file, and the model uses this tool to read the program's code: its functions, control flow, and which instructions depend on which.
 
 Each of us tests **one** AI model. Follow the steps below once, then go to [Asking questions](#asking-questions).
 
@@ -140,6 +140,23 @@ python cfg_agent.py -q sample.exe
 
 While it works, you'll see lines like `[tool] list_functions(...)`. That's the model using the tool. The answer is printed at the end.
 
+### 16-bit and 64-bit programs
+
+Windows programs (`.exe`, `.dll`) and DOS programs (`.exe`) work with the same commands as above. The tool detects whether they're 16, 32 or 64-bit by itself.
+
+For anything else, add `--bits` to say how wide the code is (the default is 32):
+
+```bash
+# A few 64-bit hex bytes
+python cfg_agent.py --hex "48 8b c1 48 03 c2 c3" --bits 64 "What does this function return?"
+
+# A few 16-bit hex bytes
+python cfg_agent.py --hex "55 89 e5 8b 46 04 03 46 06 5d c2 04 00" --bits 16 "What does this function compute?"
+
+# A DOS .COM file (16-bit raw code that starts at address 0x100)
+python cfg_cli.py program.com --bits 16 --base 0x100
+```
+
 **Remember the daily limit:** 50 requests per day, and a verdict run uses about 5–10 of them (see [The daily limit](#the-daily-limit)). Plan your testing so you don't run out halfway through.
 
 **Can't use the AI right now?** (no internet, key problem, daily limit) You can still look at a file's code without AI:
@@ -160,7 +177,7 @@ python cfg_cli.py sample.exe
 | `can't reach OpenRouter` | Check your internet connection. |
 | `rejected your API key` / `Error code: 401` | Your key is wrong or was deleted. Check `.env`, or make a new key. |
 | `Error code: 404` / `No endpoints found` | Your model was removed from OpenRouter. Tell Keerat. |
-| `ERROR: ...` about the file or an address | The file isn't supported (e.g. a 64-bit program) or the address is wrong. The model usually corrects itself; if not, check the file or address. |
+| `ERROR: ...` about the file or an address | The file isn't supported (e.g. an ARM program or a 16-bit Windows program) or the address is wrong. The model usually corrects itself; if not, check the file or address. |
 | `pip install` fails | Check that `python --version` shows 3.10 or newer and that the environment is active (step 1), then run `pip install --upgrade pip` and try again. |
 
 ### What to send Keerat
@@ -186,7 +203,11 @@ You'll see this in the `[tool]` output, or when you run `cfg_cli.py`:
 
 - **D**: what the instruction writes. **U**: what it reads.
 - **DD**: the earlier instructions whose values it reads. **START** means "the value at the start of the function".
-- **stk_N**: a stack slot. `stk_4` is the first argument; negative numbers are local variables and saved registers.
+- **stk_N**: a stack slot. Negative numbers are local variables and saved registers. The first stack argument depends on the program:
+  - **32-bit:** `stk_4`
+  - **64-bit:** the first four arguments are in the registers `rcx`, `rdx`, `r8`, `r9`; the 5th is `stk_40`
+  - **16-bit:** `stk_2` (`stk_4` for functions that end in `retf`)
+- **Register names** match the program: `eax` in 32-bit, `rax` and `r8`–`r15` in 64-bit, `ax` in 16-bit.
 - **B0, B1, …**: basic blocks (straight-line chunks of code) and where each one jumps to.
 - **`<kernel32!Sleep>`**: the Windows API being called.
 - **`note: ...`**: the tool fixed one of its own guesses. Nothing to worry about.
@@ -194,7 +215,9 @@ You'll see this in the `[tool]` output, or when you run `cfg_cli.py`:
 
 ## Limitations
 
-- Only **32-bit** programs. 64-bit programs are rejected.
+- Supported: **32-bit and 64-bit Windows** programs, **16-bit DOS** `.exe` programs, and raw code (with `--bits`). ARM programs and 16-bit Windows programs are rejected.
+- 64-bit: argument counts follow the Windows calling convention, not the Linux one.
+- 16-bit DOS: addresses are shown as one number (segment × 16 + offset). Code in other segments is only found when a far call leads to it. DOS system calls (`int 21h`) aren't named.
 - Switch statements (jump tables) aren't followed, so parts of some functions may be missing.
 - Calls through registers that aren't Windows APIs show up as `indirect(...)`.
 - Free models sometimes misread the tool's output. Double-check important answers.
@@ -211,6 +234,8 @@ python cfg_cli.py sample.exe --format dot --mode cfg -o out.dot   # Lab 3 style 
 python cfg_cli.py sample.exe --format dot --mode ddg -o out.dot   # Lab 4 style graph
 python cfg_cli.py sample.exe --format json --sweep                # JSON, including unreachable code
 python cfg_cli.py --hex "55 8b ec 5d c3" --base 0x401000
+python cfg_cli.py --hex "55 48 89 e5 5d c3" --bits 64            # 64-bit hex bytes
+python cfg_cli.py program.com --bits 16 --base 0x100              # DOS .COM file
 ```
 
 Turn a `.dot` file into a picture with Graphviz: `dot -Tpng out.dot -o out.png`
@@ -230,8 +255,9 @@ Provides the tools `list_functions`, `get_function` and `analyze_hex`. It doesn'
 **Check samples for stack warnings** (no AI, no network; it only reads the files and never runs them):
 
 ```bash
-python cfg_check.py samples/        # every PE file in the folder
+python cfg_check.py samples/        # every PE / DOS file in the folder
 python cfg_check.py a.exe -v        # list each warning with the sample's SHA-256
+python cfg_check.py raw.bin --bits 64 --base 0x140001000   # raw code needs --bits (default 32)
 ```
 
 Each line in a `cfgtool_warnings.log` is tab-separated: date, model, file name, SHA-256, function address, warning. Match the SHA-256 to your copy of the sample and run `cfg_check.py` on it to reproduce.

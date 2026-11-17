@@ -13,11 +13,11 @@ import os
 
 from capstone import CS_GRP_CALL
 
-from cfg_core import Analyzer, Image, parse_hex, to_text
+from cfg_core import Analyzer, Image, parse_bits, parse_hex, to_text
 
 DEFAULT_MAX_INSTRUCTIONS = 150
 FUNCTIONS_PER_PAGE = 60
-_CACHE = {}  # (abs path, mtime, base) -> (Analyzer, image, default entries, sha256)
+_CACHE = {}  # (abs path, mtime, base, bits) -> (Analyzer, image, default entries, sha256)
 
 # Stack warnings seen this session: (sha256, function address, message) -> file name.
 # cfg_agent.py writes these to a log for the developer.
@@ -54,16 +54,17 @@ def _image_span(img):
     return ", ".join("0x%x-0x%x" % (b, b + len(d)) for b, d, _ in img.segments)
 
 
-def _load(path, base_address):
+def _load(path, base_address, bits=None):
     path = os.path.abspath(os.path.expanduser(str(path)))
     if not os.path.isfile(path):
         raise ValueError("file not found: %s" % path)
     base = parse_address(base_address)
-    key = (path, os.path.getmtime(path), base)
+    bits = parse_bits(bits)
+    key = (path, os.path.getmtime(path), base, bits)
     if key not in _CACHE:
         with open(path, "rb") as f:
             data = f.read()
-        img, entries = Image.from_bytes(data, base)
+        img, entries = Image.from_bytes(data, base, bits)
         _CACHE[key] = (Analyzer(img), img, entries, hashlib.sha256(data).hexdigest())
     return _CACHE[key]
 
@@ -98,18 +99,18 @@ def _safe(fn):
 
 # -------------------------------------------------------------------- tools
 @_safe
-def list_functions(path, base_address="0x401000", include_unreachable=False, offset=0):
+def list_functions(path, base_address="0x401000", include_unreachable=False, offset=0, bits=None):
     """One line per function: address, size, and the functions it calls.
     Shows FUNCTIONS_PER_PAGE functions starting at `offset`."""
-    an, img, entries, sha = _load(path, base_address)
+    an, img, entries, sha = _load(path, base_address, bits)
     starts = an.discover(entries, sweep=bool(include_unreachable))
     if not starts:
         return "ERROR: no decodable code at entry %s; image spans %s" % (
             [hex(e) for e in entries], _image_span(img))
     offset = max(0, int(offset or 0))
     page = starts[offset:offset + FUNCTIONS_PER_PAGE]
-    lines = ["%d functions (entry point: %s). Use get_function(address) for details."
-             % (len(starts), ", ".join("0x%x" % e for e in entries))]
+    lines = ["%s: %d functions (entry point: %s). Use get_function(address) for details."
+             % (img.describe(), len(starts), ", ".join("0x%x" % e for e in entries))]
     if len(starts) > FUNCTIONS_PER_PAGE:
         lines.append("Showing functions %d-%d of %d." % (offset + 1, offset + len(page), len(starts)))
     for s in page:
@@ -132,10 +133,10 @@ def list_functions(path, base_address="0x401000", include_unreachable=False, off
 
 @_safe
 def get_function(path, address, base_address="0x401000",
-                 format="text", max_instructions=DEFAULT_MAX_INSTRUCTIONS):
+                 format="text", max_instructions=DEFAULT_MAX_INSTRUCTIONS, bits=None):
     """CFG of one function: basic blocks, edges, defs/uses and data dependencies.
     An address inside a function returns the whole containing function."""
-    an, img, entries, sha = _load(path, base_address)
+    an, img, entries, sha = _load(path, base_address, bits)
     addr = parse_address(address)
     _check_addr(an, img, addr)
     start, note = addr, ""
@@ -154,10 +155,10 @@ def get_function(path, address, base_address="0x401000",
 
 @_safe
 def analyze_hex(code_hex, base_address="0x401000",
-                format="text", max_instructions=DEFAULT_MAX_INSTRUCTIONS):
+                format="text", max_instructions=DEFAULT_MAX_INSTRUCTIONS, bits=32):
     """CFG of a short machine-code snippet given as hex bytes (all functions it calls included)."""
     data = parse_hex(code_hex)
-    img, entries = Image.from_bytes(data, parse_address(base_address))
+    img, entries = Image.from_bytes(data, parse_address(base_address), parse_bits(bits) or 32)
     an = Analyzer(img)
     _check_addr(an, img, entries[0])
     funcs = an.analyze(entries)
@@ -181,13 +182,18 @@ _BASE = {"type": "string", "description": "Load address for raw (non-PE) files. 
                                            "Ignored for PE files. Default '0x401000'."}
 _FMT = {"type": "string", "enum": ["text", "json"],
         "description": "'text' (default, easiest to read) or 'json'."}
+_BITS = {"type": "integer", "enum": [16, 32, 64],
+         "description": "Code width for raw (non-PE) files: 16, 32 or 64. Ignored for PE and "
+                        "DOS MZ files, which set their own. Default 32; use 16 (with "
+                        "base_address '0x100') for .COM files."}
 _MAX = {"type": "integer", "description": "Max instructions to show, text format only (default %d)."
                                           % DEFAULT_MAX_INSTRUCTIONS}
 
 TOOL_SCHEMAS = [
     {"type": "function", "function": {
         "name": "list_functions",
-        "description": "List the functions in a binary file (32-bit x86 PE or raw code). "
+        "description": "List the functions in a binary file (x86 PE 32/64-bit, 16-bit DOS MZ, "
+                       "or raw code). The first line says whether the code is 16, 32 or 64-bit. "
                        "Call this first to get function addresses.",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string", "description": "Path to the binary file."},
@@ -196,6 +202,7 @@ TOOL_SCHEMAS = [
                                     "description": "Also list code not reached from the entry point."},
             "offset": {"type": "integer",
                        "description": "Skip this many functions (for paging; default 0)."},
+            "bits": _BITS,
         }, "required": ["path"]}}},
     {"type": "function", "function": {
         "name": "get_function",
@@ -207,16 +214,19 @@ TOOL_SCHEMAS = [
             "base_address": _BASE,
             "format": _FMT,
             "max_instructions": _MAX,
+            "bits": _BITS,
         }, "required": ["path", "address"]}}},
     {"type": "function", "function": {
         "name": "analyze_hex",
-        "description": "Get the control-flow graph of a SHORT x86-32 machine-code snippet "
+        "description": "Get the control-flow graph of a SHORT x86 machine-code snippet "
                        "given as hex bytes. Use list_functions/get_function for files instead.",
         "parameters": {"type": "object", "properties": {
             "code_hex": {"type": "string", "description": "Hex bytes, e.g. '55 8b ec 5d c3'."},
             "base_address": {"type": "string", "description": "Address of the first byte. Default '0x401000'."},
             "format": _FMT,
             "max_instructions": _MAX,
+            "bits": {"type": "integer", "enum": [16, 32, 64],
+                     "description": "Code width: 16, 32 or 64. Default 32."},
         }, "required": ["code_hex"]}}},
 ]
 

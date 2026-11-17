@@ -12,6 +12,7 @@ Examples:
   python cfg_agent.py --model 2 sample.exe "..."                           # model #2 from MODELS
   python cfg_agent.py --compare sample.exe "..."                           # ask all 3 models
   python cfg_agent.py --hex "55 8b ec 8b 45 08 5d c3" "What does this return?"
+  python cfg_agent.py --hex "48 8b c1 48 03 c2 c3" --bits 64 "What does this return?"
   python cfg_agent.py --list-models
 
 --model also accepts any OpenRouter model ID (https://openrouter.ai/models, filter by "Tools").
@@ -62,7 +63,7 @@ def resolve_model(m):
         return MODELS[int(m) - 1]
     return m or MODELS[0]
 
-SYSTEM = """You are a reverse-engineering assistant for 32-bit x86 code.
+SYSTEM = """You are a reverse-engineering assistant for x86 code (16, 32 or 64-bit).
 You have tools that build control-flow graphs with def/use and data-dependency info.
 Rules:
 - For a file: call list_functions first, then get_function on the functions you need.
@@ -215,10 +216,12 @@ def main():
         except (AttributeError, ValueError):
             pass
     load_dotenv()
-    p = argparse.ArgumentParser(description="Ask free OpenRouter models about x86-32 code using the CFG tools.")
+    p = argparse.ArgumentParser(description="Ask free OpenRouter models about x86 code (16/32/64-bit) using the CFG tools.")
     p.add_argument("args", nargs="*", metavar="[FILE] QUESTION",
                    help="binary file and question (just the question when using --hex)")
     p.add_argument("--hex", help="analyze these hex bytes instead of a file")
+    p.add_argument("--bits", type=int, choices=[16, 32, 64],
+                   help="code width for --hex or a raw file (default 32); PE and DOS files set their own")
     p.add_argument("--model", default=os.environ.get("CFG_MODEL"),
                    help="1-%d (from MODELS) or an OpenRouter model ID; default: CFG_MODEL in .env, "
                         "else model 1" % len(MODELS))
@@ -238,7 +241,8 @@ def main():
         p.error("no API key: put OPENROUTER_API_KEY=sk-or-... in .env (see .env.example) or export it")
     if a.hex:
         question = " ".join(a.args)
-        q = "Machine code (hex, load address 0x401000): %s\n\n" % a.hex
+        q = ("Machine code (hex, load address 0x401000, %d-bit; pass bits=%d to analyze_hex): %s\n\n"
+             % (a.bits or 32, a.bits or 32, a.hex))
     else:
         if len(a.args) < 1:
             p.error("give a file (and optionally a question), or use --hex")
@@ -246,6 +250,8 @@ def main():
             p.error("file not found: %s" % a.args[0])
         question = " ".join(a.args[1:])
         q = "Binary file path: %s\n\n" % os.path.abspath(a.args[0])
+        if a.bits:
+            q += "If this is a raw (non-PE) file, pass bits=%d to the tools.\n\n" % a.bits
     a.verdict = a.verdict or not question  # no question = "is this malicious?" verdict
     q += (question or VERDICT_QUESTION) + (VERDICT_INSTRUCTIONS if a.verdict else "")
 
