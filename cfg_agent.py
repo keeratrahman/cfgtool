@@ -27,6 +27,7 @@ from openai import (APIConnectionError, APIError, APIStatusError, APITimeoutErro
                     AuthenticationError, InternalServerError, OpenAI, RateLimitError)
 
 import cfg_tools
+from cfg_core import ANALYSIS_VERSION
 from cfg_tools import TOOL_SCHEMAS, dispatch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -69,6 +70,12 @@ Rules:
 - For a file: call list_functions first, then get_function on the functions you need.
 - Addresses are hex strings like "0x401000".
 - If a tool returns "ERROR: ...", read it, fix the arguments and try again.
+- Lines starting with "WARNING:" or "note:" come from the tool's static analysis, not from you;
+  any model gets the same lines. They only mean stack-slot names are uncertain there (shown as
+  stk_?(...)): keep using the control flow, calls and register data. Don't blame yourself or
+  the model for them. Unusual stack behaviour can itself be a sign of hand-written or
+  obfuscated code.
+- Each function has an "about:" line (frame, arguments, how it ends, anything unusual).
 - Base your answer only on tool output. Cite instruction addresses."""
 
 VERDICT_QUESTION = "Has malicious code been put into this program? Analyze it and give your verdict."
@@ -83,6 +90,9 @@ How to decide:
 - Signs that code is hidden or obfuscated: many indirect(...) calls or jumps to computed
   addresses, loops that decode or copy bytes and then jump to them, huge functions with many
   dead ends, junk instructions, or almost no code at all where a real program should be.
+  Stack tricks listed after "Unusual:" in a function's about line (call/pop reading its own
+  address, push/ret used as a jump, esp set directly, paths with different stack heights) are
+  common in packers, shellcode and decoders; normal compiled code rarely has them.
   A program that is simply small is NOT obfuscated.
 - If you can see the code and nothing in it is malicious, answer CLEAN. Do not call a file
   SUSPICIOUS just because it is small or because you cannot rule everything out.
@@ -262,14 +272,29 @@ def main():
 
 
 def flush_warnings(model):
-    """Append this run's stack warnings to the log (sample SHA-256, never its contents)."""
+    """Append this run's new stack warnings to the log (sample SHA-256, never its contents).
+    Columns: time, model, file name, sha256, function, message, analysis version. A warning
+    already logged for the same sample, function and analysis version is not logged again."""
     if not cfg_tools.WARNINGS:
+        return
+    seen = set()
+    try:
+        with open(WARNING_LOG, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                c = line.rstrip("\n").split("\t")
+                if len(c) >= 6:
+                    seen.add((c[3], c[4], c[5], c[6] if len(c) > 6 else ""))
+    except OSError:
+        pass
+    new = [(k, fname) for k, fname in cfg_tools.WARNINGS.items()
+           if k + (ANALYSIS_VERSION,) not in seen]
+    if not new:
         return
     stamp = datetime.datetime.now().isoformat(timespec="seconds")
     with open(WARNING_LOG, "a", encoding="utf-8") as f:
-        for (sha, func, msg), fname in cfg_tools.WARNINGS.items():
-            f.write("\t".join([stamp, str(model), fname, sha, func, msg]) + "\n")
-    n = len(cfg_tools.WARNINGS)
+        for (sha, func, msg), fname in new:
+            f.write("\t".join([stamp, str(model), fname, sha, func, msg, ANALYSIS_VERSION]) + "\n")
+    n = len(new)
     sys.stdout.flush()
     print("\n[cfgtool] %d stack warning%s logged in %s. Please send this file to %s."
           % (n, "s" * (n > 1), os.path.basename(WARNING_LOG), DEVELOPER), file=sys.stderr)

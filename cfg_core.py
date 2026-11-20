@@ -26,7 +26,25 @@ from capstone import (CS_ARCH_X86, CS_AC_READ, CS_AC_WRITE, CS_GRP_CALL,
 from capstone.x86_const import X86_PREFIX_REP, X86_PREFIX_REPNE
 
 START = "START"
+ANALYSIS_VERSION = "2026-11-20"  # bump when analysis results change (written to the warning log)
 BITS = (16, 32, 64)
+
+# Imported functions that never return to their caller (matched on the name after "dll!",
+# case-insensitive). Code after a call to one of these is not part of the call's path.
+_NORETURN_APIS = {
+    "exitprocess", "exitthread", "freelibraryandexitthread", "rtlexituserprocess",
+    "rtlexituserthread", "fatalexit", "fatalappexita", "fatalappexitw", "rtlraisestatus",
+    "exit", "_exit", "_exit_", "quick_exit", "abort", "_amsg_exit", "terminate",
+    "__std_terminate", "_invalid_parameter_noinfo_noreturn", "_cxxthrowexception",
+    "longjmp", "_longjmp", "__report_gsfailure", "__report_rangecheckfailure",
+}
+
+
+_COMPLEX = object()  # marker: stack effect depends on state (see Analyzer._fixed_effect)
+
+
+def _api_noreturn(name):
+    return bool(name) and name.split("!")[-1].lower() in _NORETURN_APIS
 _CS_MODE = {16: CS_MODE_16, 32: CS_MODE_32, 64: CS_MODE_64}
 
 # ----------------------------------------------------------------- registers
@@ -114,8 +132,14 @@ class Mode:
                  64: "args 1-4 are in rcx, rdx, r8, r9; stk_40 = 5th arg"}[self.bits]
         return ("Legend: %d-bit code. D = locations written, U = locations read, DD = addresses "
                 "of the instructions whose values this one reads (START = value on function "
-                "entry), stk_N = stack slot at offset N from %s on entry (%s), Bk = basic "
-                "block, '-' = none." % (self.bits, self.sp, first))
+                "entry), stk_N = stack slot at offset N from %s on entry (%s), "
+                "stk_?(%s+N) = stack slot whose offset is unknown because stack tracking was "
+                "lost there, Bk = basic block, '-' = none. 'about' summarizes each function. "
+                "WARNING/note lines report limits of this static analysis (often caused by "
+                "obfuscation, packers or hand-written stack tricks), not mistakes by you, and "
+                "another model would get the same lines; control flow, register D/U/DD and the "
+                "stk_N names that are shown remain usable."
+                % (self.bits, self.sp, first, self.sp))
 
 
 # --------------------------------------------------------------------- image
@@ -238,6 +262,14 @@ class Analyzer:
         self._leaders = set()   # function starts, branch targets, and fall-throughs after branches
         self._api_purge = {}    # "dll!func" -> bytes popped, learned from balanced functions
         self._call_fix = {}     # call address -> bytes popped, corrected by stack balancing
+        self._succ = {}         # successors() cache, so every pass sees the same graph
+        self._visited = set()   # every address collect() has walked so far
+        self._returns = {}      # function start -> False if it can never return
+        self._busy = set()      # functions whose "returns?" question is being answered
+        self._sp_eff = {}       # function start -> net stack change at its rets (None = unknown)
+        self._sp_busy = set()
+        self._fx = {}           # instruction -> constant esp change (ebp untouched), or _COMPLEX
+        self._exit = {}         # instruction -> is a ret that leaves the function
 
     # ---- decoding -------------------------------------------------------
     def insn(self, ea):
@@ -291,23 +323,120 @@ class Analyzer:
 
     # ---- control flow ---------------------------------------------------
     def successors(self, ea):
+        if ea in self._succ:
+            return self._succ[ea]
         i = self.insn(ea)
-        if i is None or i.group(CS_GRP_RET) or i.mnemonic in ("hlt", "ud2", "int3"):
-            return []
-        nxt = ea + i.size
         out = []
-        if i.group(CS_GRP_JUMP):
+        if i is None or i.mnemonic in ("hlt", "ud2", "int3") or self._terminates(i):
+            pass
+        elif i.group(CS_GRP_RET):
+            t = self.push_ret_target(ea)  # push addr; ret = jump to addr
+            if t is not None:
+                out.append(t)
+        elif i.group(CS_GRP_JUMP):
             t = self.direct_target(i)
             if t is not None:
                 out.append(t)
             if i.mnemonic not in ("jmp", "ljmp"):
-                out.append(nxt)
+                out.append(ea + i.size)
+        elif i.group(CS_GRP_CALL):
+            t = self.getpc_target(ea)
+            if t is not None:  # call $+5 / call L; L: pop = push of its own address + jump
+                out.append(t)
+            elif self.call_returns(ea):
+                out.append(ea + i.size)
         else:
-            out.append(nxt)  # includes call fall-through
-        return [s for s in dict.fromkeys(out) if self.insn(s) is not None]
+            out.append(ea + i.size)
+        out = [s for s in dict.fromkeys(out) if self.insn(s) is not None]
+        if i is not None:
+            self._succ[ea] = out
+        return out
 
     def dests(self, itemset, ea):
         return [s for s in self.successors(ea) if s in itemset]
+
+    def _terminates(self, i):
+        """int 29h (__fastfail) in 32/64-bit; int 20h and int 21h with AH=4Ch in DOS code."""
+        if i.mnemonic != "int" or not i.operands or i.operands[0].type != CS_OP_IMM:
+            return False
+        n, a = i.operands[0].imm & 0xFF, i.address
+        if self.bits != 16:
+            return n == 0x29
+        if n == 0x20:
+            return True
+        if n == 0x21:
+            if (a - 2) in self._visited and self.img.read(a - 2, 2) == b"\xb4\x4c":  # mov ah, 4Ch
+                return True
+            r = self.img.read(a - 3, 3)  # mov ax, 4Cxxh
+            return (a - 3) in self._visited and len(r) == 3 and r[0] == 0xB8 and r[2] == 0x4C
+        return False
+
+    def push_ret_target(self, ea):
+        """Target of `push imm; ret` (a jump disguised as a return), else None."""
+        i = self.insn(ea)
+        if i is None or i.mnemonic != "ret" or i.operands or self.bits == 16:
+            return None
+        p = ea - 5
+        if p not in self._visited:
+            return None
+        j = self.insn(p)
+        if (j is None or j.mnemonic != "push" or j.size != 5 or not j.operands
+                or j.operands[0].type != CS_OP_IMM):
+            return None
+        t = j.operands[0].imm & self.m.mask
+        return t if self.insn(t) is not None else None
+
+    def getpc_target(self, ea):
+        """For a call that pushes its own return address as data instead of calling a function
+        (`call $+5`, or `call L` where L starts with `pop`): the call target. Else None."""
+        i = self.insn(ea)
+        if i is None or not i.group(CS_GRP_CALL) or i.mnemonic == "lcall":
+            return None
+        t = self.direct_target(i)
+        if t is None:
+            return None
+        ti = self.insn(t)
+        if ti is None:
+            return None
+        return t if t == ea + i.size or ti.mnemonic == "pop" else None
+
+    def call_returns(self, ea):
+        """False for a call that never comes back (ExitProcess, abort, an internal function
+        with no way to return)."""
+        name = self.call_name(ea)
+        if name:
+            return not _api_noreturn(name)
+        t = self.direct_target(self.insn(ea))
+        if t is None or self.insn(t) is None:
+            return True
+        return self.func_returns(t)
+
+    def func_returns(self, t):
+        """False if no path through the function at t can return: every exit is a call that
+        never returns, hlt/ud2/int 29h, or an endless loop. Unknown cases count as returning."""
+        if t in self._returns:
+            return self._returns[t]
+        if t in self._busy or len(self._busy) > 40:  # recursion / very deep call chains
+            return True
+        self._busy.add(t)
+        try:
+            res = False
+            for a in self.collect(t):
+                if self.successors(a):
+                    continue
+                i = self.insn(a)
+                if i.mnemonic in ("hlt", "ud2") or self._terminates(i):
+                    continue
+                if (i.group(CS_GRP_CALL) or i.group(CS_GRP_JUMP)) and _api_noreturn(self.call_name(a)):
+                    continue
+                if i.group(CS_GRP_CALL) and not self.call_returns(a):
+                    continue
+                res = True  # ret, indirect jump, int3, or code we can't decode
+                break
+        finally:
+            self._busy.discard(t)
+        self._returns[t] = res
+        return res
 
     def collect(self, start):
         """All instructions reachable from start without following calls (like FuncItems)."""
@@ -319,6 +448,7 @@ class Analyzer:
             if a in seen or self.insn(a) is None:
                 continue
             seen.add(a)
+            self._visited.add(a)
             succ = self.successors(a)
             nxt = a + self.insn(a).size
             if succ != [nxt]:
@@ -344,7 +474,7 @@ class Analyzer:
                 for a in self.collect(f):
                     covered.add(a)
                     i = self.insn(a)
-                    if i.group(CS_GRP_CALL):
+                    if i.group(CS_GRP_CALL) and self.getpc_target(a) is None:
                         t = self.direct_target(i)
                         if t is not None and self.insn(t) is not None:
                             work.append(t)
@@ -485,10 +615,18 @@ class Analyzer:
         if not self.m.callee_pops:
             return 0, self._guess_call_x64(ea)[1], True
         i = self.insn(ea)
-        nxt = self.insn(ea + i.size)
-        if (nxt is not None and nxt.mnemonic == "add" and self.is_reg(nxt, 0, self.m.sp)
-                and len(nxt.operands) > 1 and nxt.operands[1].type == CS_OP_IMM):
-            return 0, max(0, sx(nxt.operands[1].imm, self.bits)) // w, True
+        a = ea + i.size
+        for _ in range(6):  # the cleanup may come a few instructions later: call f; mov edi, eax; add esp, 4
+            nxt = self.insn(a)
+            if nxt is None:
+                break
+            if (nxt.mnemonic == "add" and self.is_reg(nxt, 0, self.m.sp)
+                    and len(nxt.operands) > 1 and nxt.operands[1].type == CS_OP_IMM):
+                return 0, max(0, sx(nxt.operands[1].imm, self.bits)) // w, True
+            if (nxt.group(CS_GRP_CALL) or nxt.group(CS_GRP_JUMP) or nxt.group(CS_GRP_RET)
+                    or nxt.mnemonic in ("int3", "hlt") or self._touches_sp(nxt)):
+                break
+            a += nxt.size
         n, a = 0, ea
         while n < 16 and a not in self._leaders:
             p = self._prev(a)
@@ -514,6 +652,8 @@ class Analyzer:
     def call_effect(self, ea, overrides=None):
         """(bytes popped, number of stack args, register args) for the call at ea."""
         i = self.insn(ea)
+        if self.getpc_target(ea) is not None:
+            return 0, 0, []
         if not self.is_opaque_call(ea):
             t = self.direct_target(i)
             regs, n = self.callee_signature(t)
@@ -577,45 +717,134 @@ class Analyzer:
         return None
 
     def change_stack(self, ea, esp, ebp, overrides=None):
+        """(esp, ebp) after the instruction at ea. None = unknown: any write to esp/ebp
+        that isn't modelled makes it unknown instead of silently keeping the old value.
+        A known ebp can bring esp back (mov esp, ebp / leave)."""
+        if overrides and ea in overrides:  # trial pop count for an opaque call (_balance)
+            return (None if esp is None else esp + overrides[ea]), ebp
+        fx = self._fx.get(ea)
+        if fx is None:
+            fx = self._fx[ea] = self._fixed_effect(ea)
+        if fx is not _COMPLEX:
+            return (None if esp is None else esp + fx), ebp
+        return self._change_stack(ea, esp, ebp, overrides)
+
+    def _fixed_effect(self, ea):
+        """The esp change of an instruction whose effect doesn't depend on the current
+        esp/ebp and leaves ebp alone (push, pop, add esp, N, most calls, ordinary
+        instructions); _COMPLEX otherwise. Cached: stack passes run many times."""
+        i = self.insn(ea)
+        m, sp, bp = i.mnemonic, self.m.sp, self.m.bp
+        if m in ("push", "pop") and not (self.is_reg(i, 0, sp) or self.is_reg(i, 0, bp)):
+            return self._push_size(i) * (1 if m == "pop" else -1)
+        if i.group(CS_GRP_CALL) and self._alloca_size(ea) is None:
+            if self.getpc_target(ea) is not None:
+                return -self.m.word
+            return self.call_effect(ea)[0] if self.m.callee_pops else 0
+        if m == "leave" or m == "enter" or m in ("push", "pop") or i.group(CS_GRP_CALL):
+            return _COMPLEX
+        if m.startswith(("pusha", "popa", "pushf", "popf")) or i.group(CS_GRP_RET):
+            return _COMPLEX if m.startswith("popa") else self._change_stack(ea, 0, 0)[0]
+        written = self._regs_written(i)
+        if sp in written or bp in written:
+            return _COMPLEX
+        return 0
+
+    def _change_stack(self, ea, esp, ebp, overrides=None):
         i = self.insn(ea)
         m, w, sp, bp = i.mnemonic, self.m.word, self.m.sp, self.m.bp
-        if esp is None:
-            return esp, ebp
+
+        def add(x, d):
+            return None if x is None or d is None else x + d
+
         if m == "leave":
-            return ((ebp + w) if ebp is not None else esp), None
+            return add(ebp, w), None
+        if m == "enter":
+            size = i.operands[0].imm & 0xFFFF if i.operands else 0
+            level = i.operands[1].imm & 0x1F if len(i.operands) > 1 else 0
+            nbp = add(esp, -w)
+            return add(nbp, -(w * level + size)), nbp
         if m == "pop":
-            return esp + self._push_size(i), (None if self.is_reg(i, 0, bp) else ebp)
+            if self.is_reg(i, 0, sp):  # pop esp
+                return None, ebp
+            return add(esp, self._push_size(i)), (None if self.is_reg(i, 0, bp) else ebp)
         if m == "push":
-            return esp - self._push_size(i), ebp
+            return add(esp, -self._push_size(i)), ebp
         if m.startswith("pusha"):
-            return esp - 8 * w, ebp
+            return add(esp, -8 * w), ebp
         if m.startswith("popa"):
-            return esp + 8 * w, None  # popa reloads ebp
+            return add(esp, 8 * w), None  # popa reloads ebp
         if m.startswith("pushf"):
-            return esp - w, ebp
+            return add(esp, -w), ebp
         if m.startswith("popf"):
-            return esp + w, ebp
+            return add(esp, w), ebp
+        if i.group(CS_GRP_RET):  # only matters for push/ret jumps
+            return add(esp, w), ebp
         if i.group(CS_GRP_CALL):
+            if self.getpc_target(ea) is not None:
+                return add(esp, -w), ebp
             if not self.m.callee_pops:  # x64: callee never pops arguments
                 return esp, ebp
-            return esp + self.call_effect(ea, overrides)[0], ebp
+            probe = self._alloca_size(ea)
+            if probe is not None:
+                return add(esp, -probe), ebp
+            return add(esp, self.call_effect(ea, overrides)[0]), ebp
         if m == "mov" and self.is_reg(i, 0, bp) and self.is_reg(i, 1, sp):
             return esp, esp
         if m == "lea" and self.is_reg(i, 0, bp) and len(i.operands) == 2:  # lea ebp, [esp + N]
             return esp, self._frame_value(i.operands[1], esp, ebp)
         if m in ("mov", "lea") and self.is_reg(i, 0, sp):  # esp restored: mov esp, ebp / lea esp, [..]
-            v = self._sp_value(ea, i, esp, ebp)
-            return (v if v is not None else esp), ebp
+            return self._sp_value(ea, i, esp, ebp), ebp
         if (m in ("add", "sub") and self.is_reg(i, 0, sp)
                 and len(i.operands) > 1 and i.operands[1].type == CS_OP_IMM):
             imm = sx(i.operands[1].imm, 8 * i.operands[0].size)
-            return (esp + imm if m == "add" else esp - imm), ebp
+            return add(esp, imm if m == "add" else -imm), ebp
         if (m in ("add", "sub") and self.is_reg(i, 0, sp)
                 and len(i.operands) > 1 and i.operands[1].type == CS_OP_REG):
             imm = self._reg_const(ea, self.rname(i.operands[1].reg))
-            if imm is not None:
-                return (esp + imm if m == "add" else esp - imm), ebp
-        return esp, ebp
+            return add(esp, None if imm is None else imm if m == "add" else -imm), ebp
+        written = self._regs_written(i)
+        return (None if sp in written else esp), (None if bp in written else ebp)
+
+    def _alloca_size(self, ea):
+        """Bytes a 32/16-bit stack-probe call (`mov eax, N; call __chkstk`) moves esp down:
+        the callee itself lowers esp by eax, so its own stack doesn't balance. None otherwise."""
+        if self.bits == 64 or self.is_opaque_call(ea):
+            return None
+        i = self.insn(ea)
+        nxt = self.insn(ea + i.size)
+        if nxt is not None and nxt.mnemonic == "sub" and self.is_reg(nxt, 0, self.m.sp):
+            return None  # caller moves esp itself (mingw ___chkstk_ms)
+        v = self._reg_const(ea, self.m.ax)
+        if v is None or not 0x1000 <= v <= 0x1000000:
+            return None
+        if self._sp_effect(self.direct_target(i)) is not None:
+            return None
+        return v
+
+    def _sp_effect(self, t):
+        """Net stack change of the function at t when it reaches a ret: 0 if every ret is
+        balanced, None if unknown or unbalanced."""
+        if t in self._sp_eff:
+            return self._sp_eff[t]
+        if t in self._sp_busy:
+            return 0
+        self._sp_busy.add(t)
+        try:
+            items = self.collect(t)
+            state, _ = self._stack_pass(t, items, {}, join=True)
+            vals = {state[a][0] for a in items if a in state and self._is_exit_ret(a)}
+            res = 0 if vals == {0} else None
+        finally:
+            self._sp_busy.discard(t)
+        self._sp_eff[t] = res
+        return res
+
+    def _is_exit_ret(self, ea):
+        if ea not in self._exit:
+            i = self.insn(ea)
+            self._exit[ea] = i is not None and i.group(CS_GRP_RET) and not self.successors(ea)
+        return self._exit[ea]
 
     def _reg_const(self, ea, reg):
         """Constant in reg at ea from a nearby `mov reg, imm`, looking through one call
@@ -638,59 +867,127 @@ class Analyzer:
                 return None
         return None
 
-    def _stack_pass(self, start, items, overrides):
-        """One stack-height propagation. Returns (state, problems); a problem is
-        (kind, ea, esp_a, esp_b): 'merge' = paths disagree, 'ret' = esp != 0 at ret."""
-        itemset, state, work, problems = set(items), {}, [(start, 0, None)], []
+    def _stack_pass(self, start, items, overrides, join=False):
+        """One stack-height propagation. Returns (state, problems).
+        join=False: the first height to reach an instruction wins; problems are
+          ('merge', ea, esp_a, esp_b) and ('ret', ea, esp, 0). Used to score fixes.
+        join=True: where paths disagree the height becomes unknown (None) from there on, so
+          no wrong stk_N names are produced; problems are ('merge', ea, {pred: esp}) and
+          ('ret', ea, esp, 0)."""
+        itemset, state, problems = set(items), {}, []
+        arrive = {}  # join: ea -> {predecessor: first known esp it delivered}
+        work = [(start, 0, None, None)]
         while work:
-            ea, esp, ebp = work.pop()
+            ea, esp, ebp, pred = work.pop()
+            if join and pred is not None and esp is not None:
+                arrive.setdefault(ea, {}).setdefault(pred, esp)
             if ea in state:
-                if esp is not None and state[ea][0] is not None and state[ea][0] != esp:
-                    problems.append(("merge", ea, state[ea][0], esp))
-                continue
-            state[ea] = (esp, ebp)
-            nesp, nebp = self.change_stack(ea, esp, ebp, overrides)
+                oesp, oebp = state[ea]
+                if not join:
+                    if esp is not None and oesp is not None and oesp != esp:
+                        problems.append(("merge", ea, oesp, esp))
+                    continue
+                new = (oesp if oesp == esp else None, oebp if oebp == ebp else None)
+                if new == (oesp, oebp):
+                    continue
+                state[ea] = new
+            else:
+                state[ea] = (esp, ebp)
+            nesp, nebp = self.change_stack(ea, state[ea][0], state[ea][1], overrides)
             for d in self.dests(itemset, ea):
-                work.append((d, nesp, nebp))
+                work.append((d, nesp, nebp, ea))
+        if join:
+            for ea in sorted(arrive):
+                if len(set(arrive[ea].values())) > 1:
+                    problems.append(("merge", ea, arrive[ea]))
         for ea in items:
-            if self.insn(ea).group(CS_GRP_RET) and ea in state and state[ea][0] not in (0, None):
+            if ea in state and state[ea][0] not in (0, None) and self._is_exit_ret(ea):
                 problems.append(("ret", ea, state[ea][0], 0))
         return state, problems
 
-    def stack_states(self, start, items):
-        """Stack heights per instruction, plus warnings. If the heights don't balance,
-        try correcting the pop count of one opaque call (see guess_call) until they do."""
-        state, problems = self._stack_pass(start, items, {})
-        if problems and self.m.callee_pops:
+    def _balance(self, start, items, problems):
+        """Find pop counts for opaque calls (see guess_call) that make every path agree and
+        every ret balance. Greedy: each round applies the single change that removes the
+        most problems, so a function with several mis-guessed calls (e.g. cdecl calls whose
+        cleanup the compiler merged into one later `add esp, N`) can still be fixed.
+        Returns {call address: bytes popped}, or None if no full balance was found."""
+        w = self.m.word
+        calls = [c for c in items if self.is_opaque_call(c) and self.successors(c)
+                 and not self.guess_call(c)[2]]
+        if not calls:
+            return None
+        overrides, budget = {}, 600
+        for _ in range(6):
             deltas = []
-            for kind, _, a, b in problems:
-                deltas += [b - a] if kind == "ret" else [a - b, b - a]
-            deltas = [d for d in dict.fromkeys(deltas) if d]
-            opaque = [ea for ea in items if self.is_opaque_call(ea)]
-            for c in opaque:
-                base = self.call_effect(c)[0]
-                for d in deltas:
-                    trial = {c: base + d}
-                    if trial[c] < 0 or trial[c] > 16 * self.m.word:
+            for _, _, a, b in problems:
+                deltas += [a - b, b - a]
+            deltas = list(dict.fromkeys(deltas))
+            best = None
+            for c in calls:
+                base = self.call_effect(c, overrides)[0]
+                for v in dict.fromkeys([base + d for d in deltas] + [0]):
+                    if v == base or v < 0 or v > 16 * w or v % w:
                         continue
-                    st, pr = self._stack_pass(start, items, trial)
+                    if budget <= 0:
+                        return None
+                    budget -= 1
+                    trial = dict(overrides)
+                    trial[c] = v
+                    _, pr = self._stack_pass(start, items, trial)
                     if not pr:
-                        self._call_fix[c] = trial[c]
-                        name = self.call_name(c)
-                        if name:  # reuse at every other call site of this API
-                            self._api_purge[name] = trial[c]
-                        return st, ["note: assumed call at 0x%x pops %d bytes (balances the "
-                                    "function)" % (c, trial[c])]
-        warnings = []
-        sp = self.m.sp
-        for kind, ea, a, b in problems:
-            if kind == "merge":
-                warnings.append("WARNING: stack height differs where paths meet at 0x%x (%d vs %d); "
-                                "stk_N names from here on may be wrong" % (ea, a, b))
-            else:
-                warnings.append("WARNING: stack not balanced at ret 0x%x (%s = %d, expected 0); "
-                                "stk_N names may be wrong" % (ea, sp, a))
-        return state, warnings
+                        return trial
+                    if best is None or len(pr) < len(best[1]):
+                        best = (trial, pr)
+            if best is None or len(best[1]) >= len(problems):
+                return None
+            overrides, problems = best
+        return None
+
+    def stack_states(self, start, items):
+        """Stack heights per instruction, plus warnings/notes for the reader.
+        If the heights don't balance, first try correcting the pop counts of opaque calls
+        (see _balance); whatever still disagrees becomes unknown (stk_?)."""
+        _, problems = self._stack_pass(start, items, {})
+        notes = []
+        if problems and self.m.callee_pops:
+            fix = self._balance(start, items, problems)
+            if fix:
+                self._fx.clear()  # cached call effects change with the new pop counts
+                for c, v in sorted(fix.items()):
+                    self._call_fix[c] = v
+                    name = self.call_name(c)
+                    if name:  # reuse at every other call site of this API
+                        self._api_purge[name] = v
+                notes.append("note: to balance the stack, assumed %s"
+                             % ", ".join("the call at 0x%x pops %d bytes" % cv
+                                         for cv in sorted(fix.items())))
+        state, problems = self._stack_pass(start, items, {}, join=True)
+        sp, bp = self.m.sp, self.m.bp
+        merges = [p for p in problems if p[0] == "merge"]
+        rets = [p for p in problems if p[0] == "ret"]
+        parts = []
+        if merges:
+            _, ea, arr = merges[0]
+            s = ("stack height unknown from 0x%x (paths arrive with different %s: %s)"
+                 % (ea, sp, ", ".join("%+d from 0x%x" % (v, p) for p, v in sorted(arr.items()))))
+            if len(merges) > 1:
+                more = ["0x%x" % p[1] for p in merges[1:]]
+                s += " and at %d more place%s (%s%s)" % (len(more), "s" * (len(more) > 1),
+                                                        ", ".join(more[:3]), ", ..." * (len(more) > 3))
+            parts.append(s + "; %s-based slots there are shown as stk_?(%s+N)" % (sp, sp))
+        if rets:
+            parts.append("stack not balanced at ret %s; stk_N names in this function may be off"
+                         % ", ".join("0x%x (%s = %+d, expected 0)" % (p[1], sp, p[2]) for p in rets[:3]))
+        warnings = ["WARNING: " + "; ".join(parts)] if parts else []
+        lost = [ea for ea in items if ea in state and state[ea][0] is not None
+                and self.change_stack(ea, *state[ea])[0] is None]
+        if lost:
+            i = self.insn(lost[0])
+            notes.append("note: %s unknown after 0x%x (%s), which sets %s in a way this tool "
+                         "doesn't follow; %s-based slots after it are shown as stk_?(%s+N)%s"
+                         % (sp, lost[0], self.asm(i), sp, sp, sp,
+                            ", %s-based ones keep their names" % bp if state[lost[0]][1] is not None else ""))
+        return state, warnings + notes
 
     # ---- memory operand naming (Lab 3 memoryGetName + Lab 4 mem_address) --
     def mem_name(self, op, esp, ebp, i=None):
@@ -710,6 +1007,8 @@ class Analyzer:
             baseval = esp if base == self.m.sp else ebp
             if baseval is not None:
                 return "stk_%d" % (baseval + disp), regs
+            if base == self.m.sp:  # stack slot, but tracking was lost: say so
+                return "stk_?(%s%s)" % (base, "" if not disp else "%s0x%x" % ("+-"[disp < 0], abs(disp))), regs
         parts = []
         if base:
             parts.append(base)
@@ -782,12 +1081,19 @@ class Analyzer:
         elif i.group(CS_GRP_RET):
             add_unique(d, sp)
             add_unique(u, sp)
+            if esp is not None and self.push_ret_target(ea) is not None:
+                add_unique(u, "stk_%d" % esp)
         elif base_m.startswith("leave"):
             add_unique(d, bp)
             add_unique(u, bp)
             add_unique(d, sp)
             if ebp is not None:
                 add_unique(u, "stk_%d" % ebp)
+        elif i.group(CS_GRP_CALL) and self.getpc_target(ea) is not None:
+            add_unique(d, sp)  # pushes its own address, calls nothing
+            add_unique(u, sp)
+            if esp is not None:
+                add_unique(d, "stk_%d" % (esp - w))
         elif i.group(CS_GRP_CALL):
             add_unique(d, sp)
             add_unique(u, sp)
@@ -840,7 +1146,7 @@ class Analyzer:
             items = self.collect(t)
             far = any(self.insn(x).mnemonic == "retf" for x in items)
             lowest = w + self.m.arg_area + (2 if far else 0)
-            state, _ = self._stack_pass(t, items, {})
+            state, _ = self._stack_pass(t, items, {}, join=True)
             for x in items:
                 for op in self.insn(x).operands:
                     if op.type == CS_OP_MEM:
@@ -918,6 +1224,77 @@ class Analyzer:
             blocks.append({"start": L, "instructions": members, "successors": succ[members[-1]]})
         return blocks
 
+    def about(self, start, items, stack, warnings):
+        """One-line summary of the function for the reader: frame, arguments, how it ends,
+        and anything unusual about its stack or control flow."""
+        sp, bp, w = self.m.sp, self.m.bp, self.m.word
+        out, odd = [], []
+        framed = False
+        for ea in items:
+            i = self.insn(ea)
+            if ((i.mnemonic == "mov" and self.is_reg(i, 0, bp) and self.is_reg(i, 1, sp))
+                    or (i.mnemonic == "lea" and self.is_reg(i, 0, bp)) or i.mnemonic == "enter"):
+                framed = stack.get(ea, (None,))[0] is not None
+                break
+        out.append("%s frame" % bp if framed else "no frame pointer (%s-based)" % sp)
+        regs, nstack = self.callee_signature(start)
+        purge = self.callee_purge(start) if self.m.callee_pops else 0
+        if purge:
+            out.append("callee pops %d bytes of args (ret %d)" % (purge, purge))
+        elif nstack:
+            out.append("reads %d stack arg%s" % (nstack, "s" * (nstack > 1)))
+        if regs:
+            out.append("register args: %s" % ", ".join(regs))
+        exits = [ea for ea in items if not self.successors(ea)]
+        rets = [ea for ea in exits if self.insn(ea).group(CS_GRP_RET)]
+        noret = [ea for ea in exits if self.insn(ea).group(CS_GRP_CALL)]
+        indirect = [ea for ea in items if self.insn(ea).group(CS_GRP_JUMP)
+                    and self.direct_target(self.insn(ea)) is None and not self.call_name(ea)]
+
+        def where(eas):
+            return ", ".join("0x%x" % a for a in eas[:3]) + (", ..." if len(eas) > 3 else "")
+
+        def callee(ea):
+            return self.call_name(ea) or "0x%x" % (self.direct_target(self.insn(ea)) or 0)
+
+        tails = [ea for ea in exits if self.insn(ea).group(CS_GRP_JUMP) and self.call_name(ea)]
+        if rets:
+            out.append("returns")
+        elif tails and len(items) <= 2:
+            out.append("thunk: jumps to %s" % self.call_name(tails[0]))
+        elif tails and not noret:
+            out.append("ends by jumping to %s" % self.call_name(tails[0]))
+        elif noret:
+            out.append("never returns (ends in call to %s)" % callee(noret[0]))
+        elif indirect:
+            out.append("no ret; leaves through an indirect jump")
+        elif not exits:
+            out.append("never returns (endless loop)")
+        else:
+            out.append("no ret")
+        if rets and noret:
+            out.append("some paths end in %s" % ", ".join(dict.fromkeys(callee(a) for a in noret)))
+        getpc = [ea for ea in items if self.getpc_target(ea) is not None]
+        if getpc:
+            odd.append("call/pop reads its own address at %s" % where(getpc))
+        pushret = [ea for ea in items if self.push_ret_target(ea) is not None]
+        if pushret:
+            odd.append("push/ret used as a jump at %s" % where(pushret))
+        direct = [ea for ea in items if self.m.sp in self._regs_written(self.insn(ea))
+                  and stack.get(ea, (None,))[0] is not None
+                  and self.change_stack(ea, *stack[ea])[0] is None]
+        if direct:
+            odd.append("sets %s directly at %s (%s)" % (sp, where(direct), self.asm(self.insn(direct[0]))))
+        if indirect:
+            odd.append("indirect jump%s at %s (jump table or computed jump)"
+                       % ("s" * (len(indirect) > 1), where(indirect)))
+        if any(x.startswith("WARNING: stack height unknown") for x in warnings):
+            odd.append("paths reach the same code with different stack heights")
+        s = "; ".join(out)
+        if odd:
+            s += ". Unusual: " + "; ".join(odd)
+        return s
+
     # ---- top level ----------------------------------------------------------
     def analyze_function(self, start):
         items = self.collect(start)
@@ -935,6 +1312,7 @@ class Analyzer:
         return {
             "entry": start,
             "bits": self.bits,
+            "about": self.about(start, items, stack, warnings),
             "warnings": warnings,
             "instructions": [{
                 "ea": ea, "asm": asm(ea),
@@ -1001,6 +1379,7 @@ def to_json(funcs):
         h = lambda x: x if x == START else "0x%x" % x
         data.append({
             "function": "0x%x" % fn["entry"],
+            "about": fn.get("about", ""),
             "warnings": fn.get("warnings", []),
             "blocks": [{
                 "start": "0x%x" % b["start"],
@@ -1036,12 +1415,16 @@ def to_text(funcs, max_instructions=None, legend=False):
         names = {b["start"]: "B%d" % k for k, b in enumerate(fn["blocks"])}
         lines.append("function 0x%x  (%d instructions, %d blocks)" %
                      (fn["entry"], len(by_ea), len(fn["blocks"])))
+        if fn.get("about"):
+            lines.append("  about: " + fn["about"])
         for w in fn.get("warnings", []):
             lines.append("  " + w)
         for b in fn["blocks"]:
             if max_instructions is not None and shown >= max_instructions:
                 break
-            succ = ", ".join("%s(0x%x)" % (names[s], s) for s in b["successors"]) or "none (exit)"
+            last = by_ea[b["instructions"][-1]]["asm"]
+            end = "none (call does not return)" if last.startswith(("call", "lcall")) else "none (exit)"
+            succ = ", ".join("%s(0x%x)" % (names[s], s) for s in b["successors"]) or end
             lines.append("  %s @0x%x -> %s" % (names[b["start"]], b["start"], succ))
             for ea in b["instructions"]:
                 if max_instructions is not None and shown >= max_instructions:

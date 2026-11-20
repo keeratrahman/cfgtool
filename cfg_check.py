@@ -8,6 +8,7 @@ Examples:
   python cfg_check.py a.exe b.dll -v           # also print each warning
   python cfg_check.py raw.bin --base 0x10000   # raw code (files given by name only)
   python cfg_check.py prog.com --bits 16 --base 0x100
+  python cfg_check.py a.exe --stack-trace 0x403365   # per-instruction stack heights of one function
 """
 import argparse
 import hashlib
@@ -41,8 +42,34 @@ def check(path, base, sweep, bits=None):
     an = Analyzer(img)
     funcs = an.analyze(entries, sweep)
     warn = [(fn["entry"], w) for fn in funcs for w in fn["warnings"] if w.startswith("WARNING")]
-    notes = sum(1 for fn in funcs for w in fn["warnings"] if w.startswith("note"))
+    notes = sum(1 for fn in funcs for w in fn["warnings"] if w.startswith("note: to balance"))
     return hashlib.sha256(data).hexdigest(), len(funcs), notes, warn
+
+
+def stack_trace(path, base, bits, addr):
+    """Developer view of one function's stack tracking."""
+    with open(path, "rb") as f:
+        data = f.read()
+    img, entries = Image.from_bytes(data, base, bits)
+    an = Analyzer(img)
+    an.discover(entries)
+    fn = an.analyze_function(addr)
+    items = [ins["ea"] for ins in fn["instructions"]]
+    state, problems = an._stack_pass(addr, items, {}, join=True)
+    sp, bp = an.m.sp, an.m.bp
+    h = lambda v: "?" if v is None else "%+d" % v
+    print("%s  function 0x%x  sha256 %s" % (path, addr, hashlib.sha256(data).hexdigest()))
+    print("about: %s" % fn["about"])
+    for w in fn["warnings"]:
+        print(w)
+    meet = {p[1]: p[2] for p in problems if p[0] == "merge"}
+    print("\n%-12s %6s %6s  instruction" % ("address", sp, bp))
+    for ins in fn["instructions"]:
+        e, b = state.get(ins["ea"], (None, None))
+        print("0x%-10x %6s %6s  %s" % (ins["ea"], h(e), h(b), ins["asm"]))
+        if ins["ea"] in meet:
+            print("%26s^ paths disagree here: %s" % ("", ", ".join(
+                "%s from 0x%x" % (h(v), p) for p, v in sorted(meet[ins["ea"]].items()))))
 
 
 def main():
@@ -53,7 +80,15 @@ def main():
                    help="code width for raw files (default 32); PE and DOS files set their own")
     p.add_argument("--sweep", action="store_true", help="also analyze code not reachable from the entry")
     p.add_argument("-v", "--verbose", action="store_true", help="print every warning")
+    p.add_argument("--stack-trace", type=parse_addr, metavar="ADDR",
+                   help="print the stack height (esp/ebp) at every instruction of the function "
+                        "at ADDR, and which paths disagree where they meet")
     a = p.parse_args()
+
+    if a.stack_trace is not None:
+        for path in iter_files(a.paths):
+            stack_trace(path, a.base, a.bits, a.stack_trace)
+        return
 
     tot_files = tot_funcs = tot_warn_funcs = errors = 0
     for path in iter_files(a.paths):

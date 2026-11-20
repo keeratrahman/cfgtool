@@ -211,7 +211,7 @@ You'll see this in the `[tool]` output, or when you run `cfg_cli.py`:
 - **B0, B1, …**: basic blocks (straight-line chunks of code) and where each one jumps to.
 - **`<kernel32!Sleep>`**: the Windows API being called.
 - **`note: ...`**: the tool fixed one of its own guesses. Nothing to worry about.
-- **`WARNING: stack ...`**: stack slot names after this point may be wrong.
+- **`WARNING: stack ...`**: stack slot names after this point may be wrong. (Updated: see [Post-Midpoint Changes](#post-midpoint-changes).)
 
 ## Limitations
 
@@ -260,8 +260,48 @@ python cfg_check.py a.exe -v        # list each warning with the sample's SHA-25
 python cfg_check.py raw.bin --bits 64 --base 0x140001000   # raw code needs --bits (default 32)
 ```
 
-Each line in a `cfgtool_warnings.log` is tab-separated: date, model, file name, SHA-256, function address, warning. Match the SHA-256 to your copy of the sample and run `cfg_check.py` on it to reproduce.
+Each line in a `cfgtool_warnings.log` is tab-separated: date, model, file name, SHA-256, function address, warning. Match the SHA-256 to your copy of the sample and run `cfg_check.py` on it to reproduce. (Updated: see [Post-Midpoint Changes](#post-midpoint-changes) for the new version column and `--stack-trace`.)
 
 **Replacing a removed model:** edit the `MODELS` list at the top of `cfg_agent.py`. Pick a free model on [openrouter.ai/models](https://openrouter.ai/models) with **Tools** support. `xingchen-agi/xing4.0-29b-a4b:free` works but is slow.
 
 **Other options:** `--model N` (use a different model for one run), `--compare` (ask all three models), `--list-models`.
+
+---
+
+## Post-Midpoint Changes
+
+Nothing changes in how you run the tool: same commands, same options, same files. The changes are in the analysis and in what the AI model is shown.
+
+### Better stack tracking
+
+- **No more silently wrong stack slot names.** When the tool can't tell where the stack is (for example, two paths reach the same code with different stack heights), it now shows the slot as `stk_?(esp+N)` instead of guessing a `stk_N` name that may be wrong. If the frame pointer (`ebp`) is still known, the tool recovers at `mov esp, ebp` / `leave`.
+- **More patterns handled**, in normal programs as well as packed or hand-written code:
+  - calls that never return (`ExitProcess`, `abort`, internal functions that can't return, DOS `int 21h` with AH=4Ch)
+  - `call $+5; pop reg` and calls over inline data (the call pushes its own address instead of calling a function)
+  - `push addr; ret` used as a jump
+  - `enter`, and stack-probe calls (`mov eax, N; call __chkstk`)
+  - several calls in one function whose argument cleanup was guessed wrong (for example, two calls cleaned up by one later `add esp, 8`), and cleanup a few instructions after the call
+- **Faster:** analyzing a large DLL takes well under half the time it did.
+
+### Reading the new output
+
+- **`stk_?(esp+N)`**: a stack slot whose exact position the tool lost track of (see the WARNING or note above it).
+- **`about:`**: a one-line summary of each function: frame, arguments, how it ends, and anything unusual (such as stack tricks common in packers).
+- **`none (call does not return)`**: the block ends in a call that never comes back.
+- **`note: ...`**: the tool fixed one of its own guesses, or lost track of the stack after an instruction it doesn't follow. Nothing to worry about.
+- **`WARNING: stack ...`**: the tool couldn't work out the stack in this function. There is now one warning per function, naming where the paths disagree; affected slots are shown as `stk_?(...)`. This comes from the analysis, not the AI model: another model would see the same warning.
+
+### What the AI model is told
+
+- WARNING and note lines are limits of the analysis, not the model's mistakes, and the control flow, calls and register data are still usable.
+- Stack tricks listed after "Unusual:" in an `about:` line are possible signs of packing or obfuscation when giving a verdict.
+
+### For Keerat
+
+```bash
+python cfg_check.py a.exe --stack-trace 0x403365   # stack height at every instruction of one function
+```
+
+- `--stack-trace` shows where the paths disagree in a function from a warning log.
+- `cfgtool_warnings.log` lines now end with a 7th column, the analysis version (older lines have 6). A warning is logged once per sample, function and analysis version, however many runs hit it, and testers are only asked to send the file when something new was logged.
+- Bump `ANALYSIS_VERSION` in `cfg_core.py` when a change alters analysis results.
